@@ -134,10 +134,15 @@ let cached: ServerEnv | null = null;
 export function getServerEnv(): ServerEnv {
   if (cached === null) {
     cached = parseServerEnv(process.env);
-    // Rate limit passcode hanya memperlambat tebakan; passcode pendek tetap
-    // bisa ditebak. Peringatan saja (bukan error) supaya demo lokal tetap jalan.
+    // Rate limit passcode hanya memperlambat tebakan, dan tanpa IP tepercaya
+    // tidak bisa membedakan penebak (plafon global sengaja tinggi) — panjang
+    // passcode-lah pertahanan sebenarnya. Peringatan saja (bukan error) supaya
+    // demo lokal tetap jalan; nilainya TIDAK pernah ditulis ke log.
     if (cached.demoPasscode.length < 12) {
-      console.warn("[env] DEMO_PASSCODE kurang dari 12 karakter — mudah ditebak di demo publik.");
+      console.warn(
+        "[env] DEMO_PASSCODE kurang dari 12 karakter — mudah ditebak di demo publik. " +
+          "Rate limit hanya memperlambat tebakan; pakai ≥12 karakter acak.",
+      );
     }
     warnIfBudgetTooSmall(cached.dailyBudgetUsd);
   }

@@ -8,11 +8,16 @@
 //   adalah daily budget global yang atomic di database (lib/server/usage.ts).
 // * Key berbasis session id dari cookie. Klien yang membuang cookie mendapat
 //   sesi baru (= kuota baru). Karena itu ada juga limiter per IP (kalau IP-nya
-//   bisa dipercaya, lihat lib/server/client-ip.ts) dan limiter GLOBAL untuk
+//   bisa dipercaya, lihat lib/server/client-ip.ts) dan plafon GLOBAL untuk
 //   passcode salah — key yang bisa diganti-ganti klien tidak boleh jadi
 //   satu-satunya rem.
 
-import { CHAT_RATE_LIMIT, PASSCODE_RATE_LIMIT } from "@/lib/config";
+import {
+  CHAT_RATE_LIMIT,
+  PASSCODE_GLOBAL_FAILURE_LIMIT,
+  PASSCODE_IP_RATE_LIMIT,
+  PASSCODE_RATE_LIMIT,
+} from "@/lib/config";
 
 export type RateLimitResult = {
   allowed: boolean;
@@ -134,23 +139,73 @@ export const chatRateLimiter = createRateLimiter(CHAT_RATE_LIMIT);
 export const passcodeRateLimiter = createRateLimiter(PASSCODE_RATE_LIMIT);
 
 /**
- * POST /api/auth: rem brute-force passcode per IP. Dibutuhkan karena limiter
- * per sesi bisa diakali dengan membuang cookie (setiap request = sesi baru).
- * Batasnya lebih longgar dari per sesi karena 1 kelas bisa berbagi 1 IP (NAT).
+ * POST /api/auth: rem UTAMA brute-force passcode — per IP, karena IP adalah
+ * satu-satunya identitas penebak yang tidak bisa diganti gratis (limiter per
+ * sesi diakali dengan membuang cookie). Hanya aktif kalau IP bisa dipercaya
+ * (Vercel / TRUSTED_PROXY_HOPS). Lebih longgar dari per sesi karena 1 kelas
+ * bisa berbagi 1 IP (NAT).
  */
-export const passcodeIpRateLimiter = createRateLimiter({ max: 20, windowMs: 60_000 });
+export const passcodeIpRateLimiter = createRateLimiter(PASSCODE_IP_RATE_LIMIT);
 
 /** Key tunggal untuk passcodeFailureLimiter (bukan per sesi / per IP). */
 export const GLOBAL_KEY = "global";
 
 /**
- * POST /api/auth: rem TERAKHIR untuk tebakan passcode — menghitung passcode
- * SALAH dari semua klien sekaligus (key tunggal GLOBAL_KEY). Limiter per sesi
- * & per IP bisa diakali dengan membuang cookie + memalsukan X-Forwarded-For;
- * yang ini tidak. Harga yang disengaja: selama ada serangan, login baru
- * semua orang ikut tertahan ≤ 1 menit (user yang sudah login tidak terganggu).
+ * POST /api/auth: PLAFON global passcode SALAH dari semua klien sekaligus
+ * (key tunggal GLOBAL_KEY). Sengaja tinggi: limiter tanpa identitas penebak
+ * juga menahan user yang sah, jadi kalau rendah, siapa pun yang mengirim
+ * tebakan pelan-pelan bisa mengunci login baru semua orang. Plafon ini hanya
+ * untuk tebakan masif (botnet / IP tidak bisa dipercaya); pertahanan
+ * sebenarnya di situ adalah passcode yang panjang & acak.
  */
-export const passcodeFailureLimiter = createRateLimiter({ max: 30, windowMs: 60_000 });
+export const passcodeFailureLimiter = createRateLimiter(PASSCODE_GLOBAL_FAILURE_LIMIT);
+
+export type PasscodeLimiters = {
+  perSession: RateLimiter;
+  perIp: RateLimiter;
+  globalFailures: RateLimiter;
+};
+
+export const passcodeLimiters: PasscodeLimiters = {
+  perSession: passcodeRateLimiter,
+  perIp: passcodeIpRateLimiter,
+  globalFailures: passcodeFailureLimiter,
+};
+
+export type PasscodeAttemptBlock = {
+  /** "global" = plafon semua klien; "client" = sesi / IP ini sendiri. */
+  scope: "global" | "client";
+  result: RateLimitResult;
+};
+
+/**
+ * Cek & catat 1 percobaan passcode di semua lapis rem. null = boleh lanjut
+ * cek passcode; kalau salah, panggil recordPasscodeFailure().
+ * Pemanggil WAJIB tidak await di antara fungsi ini dan recordPasscodeFailure():
+ * plafon global hanya di-peek di sini, jadi request paralel yang menyelip di
+ * celah await bisa sama-sama lolos sebelum ada yang tercatat.
+ */
+export function admitPasscodeAttempt(
+  limiters: PasscodeLimiters,
+  sessionId: string,
+  ip: string | null,
+  now: number = Date.now(),
+): PasscodeAttemptBlock | null {
+  // Global cuma di-peek (tidak mencatat) dan dicek duluan: selama plafon
+  // penuh, percobaan user sah tidak ikut menghabiskan kuota sesi/IP-nya.
+  const global = limiters.globalFailures.peek(GLOBAL_KEY, now);
+  if (!global.allowed) return { scope: "global", result: global };
+
+  const checks = [limiters.perSession.check(sessionId, now)];
+  if (ip !== null) checks.push(limiters.perIp.check(`ip:${ip}`, now));
+  const blocked = checks.find((result) => !result.allowed);
+  return blocked ? { scope: "client", result: blocked } : null;
+}
+
+/** Catat 1 passcode SALAH ke plafon global. */
+export function recordPasscodeFailure(limiters: PasscodeLimiters, now: number = Date.now()): void {
+  limiters.globalFailures.check(GLOBAL_KEY, now);
+}
 
 /**
  * /api/chat & /api/upload per IP (hanya kalau IP bisa dipercaya): sesi baru

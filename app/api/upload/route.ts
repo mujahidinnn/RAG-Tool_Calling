@@ -20,7 +20,6 @@ import {
   getAllowedExtension,
   readStreamWithLimit,
   sanitizeFilename,
-  uniqueFilename,
 } from "@/lib/server/upload";
 import { DAILY_LIMIT_MESSAGE, isBudgetExhausted } from "@/lib/server/usage";
 import { getSupabase } from "@/lib/supabase/client";
@@ -34,7 +33,7 @@ const TOO_MANY_FILES_MESSAGE = `Maksimal ${MAX_FILES_PER_SESSION} file per sesi.
 const SERVER_FULL_MESSAGE =
   "Server demo sedang penuh (terlalu banyak dokumen tersimpan). Coba lagi nanti — dokumen lama terhapus otomatis setelah 24 jam.";
 
-const filenameRowsSchema = z.array(z.object({ filename: z.string() }));
+const idRowsSchema = z.array(z.object({ id: z.string() }));
 // Fungsi SQL yang `returns documents` dikirim PostgREST sebagai 1 objek;
 // terima juga bentuk array 1 elemen supaya tidak rapuh.
 const createdRowSchema = z.union([
@@ -71,22 +70,22 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     const supabase = getSupabase();
-    // Cek cepat sebelum membaca body. Pengaman sebenarnya (atomic, anti
-    // upload paralel — termasuk nama file kembar) ada di RPC create_document.
+    // Cek cepat sebelum membaca body (hemat bandwidth). Pengaman sebenarnya
+    // (atomic, anti upload paralel) ada di RPC create_document.
     const { data: existingData, error: existingError } = await supabase
       .from("documents")
-      .select("filename")
+      .select("id")
       .eq("session_id", sessionId);
     if (existingError) throw new Error(`gagal membaca dokumen sesi: ${existingError.message}`);
-    const existingNames = filenameRowsSchema.parse(existingData).map((row) => row.filename);
-    if (existingNames.length >= MAX_FILES_PER_SESSION) {
+    if (idRowsSchema.parse(existingData).length >= MAX_FILES_PER_SESSION) {
       return jsonError(409, "too_many_files", TOO_MANY_FILES_MESSAGE);
     }
 
-    const filename = uniqueFilename(
-      sanitizeFilename(request.headers.get("x-filename") ?? ""),
-      existingNames,
-    );
+    // Nama TANPA penomoran: nama kembar ("a.pdf" → "a (2).pdf") dinomori
+    // create_document di bawah lock per sesi. Kalau route ikut menomori dari
+    // daftar yang dibaca di atas (tidak atomic), upload paralel bernama sama
+    // dapat nomor dobel ("a (3) (2).pdf").
+    const filename = sanitizeFilename(request.headers.get("x-filename") ?? "");
     if (!getAllowedExtension(filename)) {
       return jsonError(415, "unsupported_type", UNSUPPORTED_TYPE_MESSAGE);
     }

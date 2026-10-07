@@ -60,6 +60,14 @@ export const MAX_HISTORY_MESSAGE_CHARS = 4000;
 // --- Proteksi demo publik ---------------------------------------------------
 export const CHAT_RATE_LIMIT = { max: 20, windowMs: 60_000 } as const;
 export const PASSCODE_RATE_LIMIT = { max: 5, windowMs: 60_000 } as const;
+/** Rem utama brute-force passcode (kalau IP bisa dipercaya), lihat lib/server/rateLimit.ts. */
+export const PASSCODE_IP_RATE_LIMIT = { max: 20, windowMs: 60_000 } as const;
+/**
+ * Plafon passcode SALAH dari semua klien. Tinggi supaya penebak anonim yang
+ * pelan tidak bisa mengunci login orang lain; 300/menit tetap tidak berarti
+ * untuk passcode acak ≥12 karakter.
+ */
+export const PASSCODE_GLOBAL_FAILURE_LIMIT = { max: 300, windowMs: 60_000 } as const;
 export const DEFAULT_DAILY_BUDGET_USD = 2;
 
 // --- Cookie -----------------------------------------------------------------

@@ -239,10 +239,9 @@ function DocumentRow({
 
       {doc.status === "failed" && (
         <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs leading-5 text-red-800 dark:bg-red-500/10 dark:text-red-200">
-          <p>{doc.errorMessage ?? "Dokumen gagal diproses."}</p>
-          <p className="mt-1 text-red-700/80 dark:text-red-300/70">
-            Upload ulang file-nya — untuk PDF hasil scan, pakai versi yang teksnya bisa diseleksi.
-          </p>
+          {/* Saran perbaikan sudah ada di pesan server (beda per penyebab: scan,
+              terlalu panjang, limit harian, API key…) — jangan ditimpa saran umum. */}
+          <p>{doc.errorMessage ?? "Dokumen gagal diproses. Hapus lalu upload ulang."}</p>
           {/* Error yang actionable (spec §6): 1 klik, bukan cari ikon hapus + file lagi. */}
           <Button size="sm" variant="secondary" className="mt-2" onClick={onDeleteAndReupload} disabled={deleting}>
             <RotateCcw aria-hidden="true" />

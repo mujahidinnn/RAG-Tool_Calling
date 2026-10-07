@@ -7,6 +7,7 @@ import {
   chatReducer,
   createAssistantTurn,
   describeChatError,
+  documentReadiness,
   failTurn,
   finishTurn,
   isEmbeddingFailure,
@@ -265,5 +266,28 @@ describe("describeChatError (kartu error)", () => {
     }
     const network = finishTurn(chatTurn("anthropic"), "ended");
     assert.equal(cardFor(network).canRetry, true);
+  });
+});
+
+describe("documentReadiness (empty state panel chat)", () => {
+  const docs = (...statuses: ("processing" | "ready" | "failed")[]) => statuses.map((status) => ({ status }));
+
+  it("belum dimuat / belum ada dokumen", () => {
+    assert.equal(documentReadiness(null), "loading");
+    assert.equal(documentReadiness([]), "none");
+  });
+
+  it("ada 1 dokumen ready → bisa ditanya, walau yang lain gagal/diproses", () => {
+    assert.equal(documentReadiness(docs("failed", "ready", "processing")), "ready");
+  });
+
+  it("belum ada yang ready tapi masih ada yang diproses → menunggu", () => {
+    assert.equal(documentReadiness(docs("processing")), "processing");
+    assert.equal(documentReadiness(docs("failed", "processing")), "processing");
+  });
+
+  it("semua gagal → BUKAN 'sedang diproses' (regresi: dulu disuruh menunggu)", () => {
+    assert.equal(documentReadiness(docs("failed")), "all_failed");
+    assert.equal(documentReadiness(docs("failed", "failed")), "all_failed");
   });
 });

@@ -16,7 +16,10 @@ import { embedTexts, toPgVector } from "./embed";
 import { DOCUMENT_TOO_LONG_MESSAGE, ExtractionError, extractText } from "./extract";
 import { hasEnoughReadablePdfText, hasEnoughReadableText } from "./normalize";
 
-export const NO_TEXT_MESSAGE = "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar).";
+// Pesan failed tampil apa adanya di UI (tanpa saran tambahan), jadi tiap pesan
+// membawa sarannya sendiri.
+export const NO_TEXT_MESSAGE =
+  "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar). Upload versi PDF yang teksnya bisa diseleksi.";
 const TOO_LITTLE_TEXT_MESSAGE = `Isi file terlalu sedikit untuk diproses (minimal ${MIN_EXTRACTED_CHARS} huruf/angka).`;
 const GENERIC_FAILURE_MESSAGE =
   "Terjadi kesalahan saat memproses dokumen. Hapus dokumen ini lalu coba upload ulang.";

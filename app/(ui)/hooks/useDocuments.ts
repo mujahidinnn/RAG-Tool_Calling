@@ -76,6 +76,22 @@ export function toUploadError(err: unknown): { message: string; retryable: boole
   return { message: "Upload gagal karena kesalahan tak terduga.", retryable: true };
 }
 
+/**
+ * Slot upload yang masih kosong. Dokumen yang SEDANG dihapus dihitung kosong
+ * (alur "Hapus & upload ulang": file pengganti dipilih saat DELETE masih
+ * berjalan) — `freeing` = id-nya, upload yang memakai slot itu harus menunggu
+ * DELETE-nya selesai.
+ */
+export function freeUploadSlots(
+  documents: readonly Pick<DocumentDTO, "id">[] | null,
+  deleting: { has(id: string): boolean },
+  activeUploads: number,
+): { free: number; freeing: string[] } {
+  const docs = documents ?? [];
+  const freeing = docs.filter((doc) => deleting.has(doc.id)).map((doc) => doc.id);
+  return { free: MAX_FILES_PER_SESSION - docs.length + freeing.length - activeUploads, freeing };
+}
+
 export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void }) {
   /** null = belum pernah berhasil dimuat. */
   const [documents, setDocuments] = useState<DocumentDTO[] | null>(null);
@@ -85,6 +101,11 @@ export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void })
   const [rowErrors, setRowErrors] = useState<Readonly<Record<string, string>>>({});
 
   const controllers = useRef(new Map<string, AbortController>());
+  // id dokumen → DELETE-nya. Ref (bukan state) supaya addFiles yang dipanggil
+  // tepat setelah "Hapus & upload ulang" langsung melihatnya. Entri yang
+  // BERHASIL sengaja tidak dibuang: sampai React merender daftar baru,
+  // `documents` di closure addFiles masih memuat dokumen itu.
+  const pendingDeletes = useRef(new Map<string, Promise<void>>());
   const refreshInFlight = useRef(false);
   // Naik tiap kali daftar diubah lokal (upload selesai / dokumen dihapus).
   // Hasil fetch yang DIMULAI sebelum perubahan itu sudah basi dan dibuang —
@@ -164,14 +185,16 @@ export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void })
   }, [refresh]);
 
   const startUpload = useCallback(
-    (localId: string, file: File) => {
+    (localId: string, file: File, waitFor?: Promise<unknown>) => {
       const controller = new AbortController();
       controllers.current.set(localId, controller);
 
       const patch = (changes: Partial<UploadItem>) =>
         setUploads((prev) => prev.map((item) => (item.localId === localId ? { ...item, ...changes } : item)));
 
-      uploadDocument(file, (progress) => patch({ progress }), controller.signal)
+      // Dibatalkan saat menunggu → uploadDocument langsung menolak (signal sudah abort).
+      const upload = () => uploadDocument(file, (progress) => patch({ progress }), controller.signal);
+      (waitFor ? waitFor.then(upload) : upload())
         .then((doc) => {
           localChanges.current += 1;
           setUploads((prev) => prev.filter((item) => item.localId !== localId));
@@ -194,7 +217,14 @@ export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void })
   const addFiles = useCallback(
     (files: File[]) => {
       const activeUploads = uploads.filter((item) => item.status === "uploading").length;
-      let freeSlots = MAX_FILES_PER_SESSION - (documents?.length ?? 0) - activeUploads;
+      const slots = freeUploadSlots(documents, pendingDeletes.current, activeUploads);
+      let freeSlots = slots.free;
+      // Selama DELETE belum selesai, server masih menghitung dokumen itu (409)
+      // → upload baru menunggu DELETE-nya dulu.
+      const deletesDone =
+        slots.freeing.length > 0
+          ? Promise.allSettled(slots.freeing.map((id) => pendingDeletes.current.get(id)))
+          : undefined;
 
       const items: UploadItem[] = files.map((file) => {
         let message = validateLocally(file);
@@ -212,7 +242,7 @@ export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void })
 
       setUploads((prev) => [...items, ...prev]);
       for (const item of items) {
-        if (item.status === "uploading") startUpload(item.localId, item.file);
+        if (item.status === "uploading") startUpload(item.localId, item.file, deletesDone);
       }
     },
     [documents, uploads, startUpload],
@@ -242,30 +272,46 @@ export function useDocuments({ onUnauthorized }: { onUnauthorized: () => void })
   }, []);
 
   const removeDocument = useCallback(
-    async (id: string): Promise<void> => {
-      setDeletingIds((prev) => new Set(prev).add(id));
-      setRowErrors((prev) => withoutKey(prev, id));
-      try {
-        await deleteDocument(id);
-        localChanges.current += 1;
-        setDocuments((prev) => prev?.filter((doc) => doc.id !== id) ?? prev);
-      } catch (err) {
-        if (handleAuthError(err)) return;
-        if (err instanceof ApiClientError && err.code === "not_found") {
-          // Sudah tidak ada di server (mis. terhapus otomatis setelah 24 jam).
+    (id: string): Promise<void> => {
+      const inFlight = pendingDeletes.current.get(id);
+      if (inFlight) return inFlight;
+
+      /** true = dokumen sudah tidak ada di server (slotnya kosong). */
+      const run = async (): Promise<boolean> => {
+        setDeletingIds((prev) => new Set(prev).add(id));
+        setRowErrors((prev) => withoutKey(prev, id));
+        try {
+          await deleteDocument(id);
           localChanges.current += 1;
           setDocuments((prev) => prev?.filter((doc) => doc.id !== id) ?? prev);
-          return;
+          return true;
+        } catch (err) {
+          if (handleAuthError(err)) return false;
+          if (err instanceof ApiClientError && err.code === "not_found") {
+            // Sudah tidak ada di server (mis. terhapus otomatis setelah 24 jam).
+            localChanges.current += 1;
+            setDocuments((prev) => prev?.filter((doc) => doc.id !== id) ?? prev);
+            return true;
+          }
+          const message = err instanceof Error ? err.message : "Gagal menghapus dokumen.";
+          setRowErrors((prev) => ({ ...prev, [id]: message }));
+          return false;
+        } finally {
+          setDeletingIds((prev) => {
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+          });
         }
-        const message = err instanceof Error ? err.message : "Gagal menghapus dokumen.";
-        setRowErrors((prev) => ({ ...prev, [id]: message }));
-      } finally {
-        setDeletingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(id);
-          return next;
-        });
-      }
+      };
+
+      // Gagal → buang entrinya: dokumen masih ada (slotnya terpakai) dan
+      // "Coba hapus lagi" harus menjalankan DELETE baru.
+      const promise = run().then((gone) => {
+        if (!gone) pendingDeletes.current.delete(id);
+      });
+      pendingDeletes.current.set(id, promise);
+      return promise;
     },
     [handleAuthError],
   );

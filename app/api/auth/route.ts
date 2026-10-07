@@ -19,10 +19,9 @@ import type { ProviderName } from "@/lib/llm/types";
 import { errorFromUnknown, getClientIp, jsonError, readJsonBody } from "@/lib/server/http";
 import { maybeCleanupExpired } from "@/lib/server/cleanup";
 import {
-  GLOBAL_KEY,
-  passcodeFailureLimiter,
-  passcodeIpRateLimiter,
-  passcodeRateLimiter,
+  admitPasscodeAttempt,
+  passcodeLimiters,
+  recordPasscodeFailure,
   type RateLimitResult,
 } from "@/lib/server/rateLimit";
 import {
@@ -90,31 +89,33 @@ export async function POST(request: Request): Promise<Response> {
     const sessionId = await getOrCreateSessionId();
     after(() => maybeCleanupExpired());
 
-    // Rate limit DULUAN (sebelum parse & cek passcode) supaya setiap percobaan
-    // terhitung. 3 lapis, karena key per sesi & per IP bisa diganti-ganti klien:
-    // 1. global: terlalu banyak passcode SALAH dari semua klien → semua ditahan
-    //    sebentar (cek saja; yang dicatat hanya percobaan yang salah, di bawah).
-    const global = passcodeFailureLimiter.peek(GLOBAL_KEY);
-    if (!global.allowed) {
-      return tooManyAttempts(global, "Terlalu banyak percobaan passcode yang salah di server ini.");
-    }
-    // 2. per sesi (kontrak) + 3. per IP (hanya kalau IP bisa dipercaya).
-    const ip = getClientIp(request.headers);
-    const checks = [passcodeRateLimiter.check(sessionId)];
-    if (ip !== null) checks.push(passcodeIpRateLimiter.check(`ip:${ip}`));
-    const blocked = checks.find((result) => !result.allowed);
-    if (blocked) return tooManyAttempts(blocked, "Terlalu banyak percobaan passcode.");
-
-    // Body passcode itu kecil; batasi 4 KB supaya tidak bisa dipakai membanjiri memori.
+    // Body (kecil; maks 4 KB supaya tidak bisa dipakai membanjiri memori)
+    // dibaca SEBELUM rate limit: dari cek limiter sampai pencatatan passcode
+    // salah tidak boleh ada await, kalau tidak request paralel bisa sama-sama
+    // lolos plafon global sebelum ada yang tercatat.
     const body = await readJsonBody(request, 4 * 1024);
     if (!body.ok) return body.response;
+
+    // Rate limit sebelum parse & cek passcode supaya setiap percobaan terhitung.
+    // Lapis: per IP (rem utama, kalau IP bisa dipercaya), per sesi, dan plafon
+    // global passcode salah (lib/server/rateLimit.ts).
+    const blocked = admitPasscodeAttempt(passcodeLimiters, sessionId, getClientIp(request.headers));
+    if (blocked) {
+      return tooManyAttempts(
+        blocked.result,
+        blocked.scope === "global"
+          ? "Terlalu banyak percobaan passcode yang salah di server ini."
+          : "Terlalu banyak percobaan passcode.",
+      );
+    }
+
     const parsed = passcodeBodySchema.safeParse(body.value);
     if (!parsed.success) {
       return jsonError(400, "bad_request", "Passcode wajib diisi (maks 200 karakter).");
     }
 
     if (!verifyPasscode(parsed.data.passcode)) {
-      passcodeFailureLimiter.check(GLOBAL_KEY);
+      recordPasscodeFailure(passcodeLimiters);
       return jsonError(401, "invalid_passcode", "Passcode salah.");
     }
 

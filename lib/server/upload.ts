@@ -183,19 +183,3 @@ export function sanitizeFilename(raw: string): string {
   }
   return name;
 }
-
-/**
- * Hindari nama kembar di 1 sesi ("laporan.pdf" → "laporan (2).pdf"), supaya
- * sitasi `[laporan.pdf, chunk #3]` tidak ambigu menunjuk dua dokumen.
- */
-export function uniqueFilename(name: string, existing: readonly string[]): string {
-  const taken = new Set(existing.map((n) => n.toLowerCase()));
-  if (!taken.has(name.toLowerCase())) return name;
-
-  const ext = /\.[a-z0-9]{1,10}$/i.exec(name)?.[0] ?? "";
-  const base = name.slice(0, name.length - ext.length);
-  for (let i = 2; ; i++) {
-    const candidate = `${base} (${i})${ext}`;
-    if (!taken.has(candidate.toLowerCase())) return candidate;
-  }
-}

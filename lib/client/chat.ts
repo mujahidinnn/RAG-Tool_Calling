@@ -11,6 +11,7 @@ import type {
   ApiErrorCode,
   ChatHistoryMessage,
   ChatStreamEvent,
+  DocumentStatus,
   ProviderInfo,
   ProviderName,
   Source,
@@ -311,6 +312,21 @@ export function buildHistory(turns: readonly ChatTurn[]): ChatHistoryMessage[] {
     );
   }
   return history.slice(-MAX_HISTORY_MESSAGES);
+}
+
+/**
+ * Kondisi dokumen untuk empty state panel chat. "all_failed" dipisah dari
+ * "processing": dokumen gagal tidak akan pernah siap, jadi user perlu tahu
+ * harus upload ulang — bukan menunggu.
+ */
+export type DocumentReadiness = "loading" | "none" | "ready" | "processing" | "all_failed";
+
+export function documentReadiness(documents: readonly { status: DocumentStatus }[] | null): DocumentReadiness {
+  if (documents === null) return "loading";
+  if (documents.length === 0) return "none";
+  if (documents.some((doc) => doc.status === "ready")) return "ready";
+  if (documents.some((doc) => doc.status === "processing")) return "processing";
+  return "all_failed";
 }
 
 // --- Reducer --------------------------------------------------------------------------

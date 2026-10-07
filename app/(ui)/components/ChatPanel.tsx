@@ -7,13 +7,14 @@ import {
   buildHistory,
   chatReducer,
   createAssistantTurn,
+  documentReadiness,
   isStreaming,
   type AssistantTurn,
   type ChatErrorInfo,
   type ChatTurn,
 } from "@/lib/client/chat";
 import { formatNumber } from "@/lib/client/format";
-import { MAX_QUESTION_CHARS } from "@/lib/config";
+import { MAX_FILES_PER_SESSION, MAX_QUESTION_CHARS } from "@/lib/config";
 import type { DocumentDTO, ProviderInfo, ProviderName } from "@/lib/types";
 import type { SourcesView } from "./ChunkPanel";
 import { AssistantMessage, UserMessage } from "./MessageBubble";
@@ -230,7 +231,6 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
           {turns.length === 0 ? (
             <EmptyChat
               documents={documents}
-              readyCount={readyCount}
               latestReadyName={latestReady?.filename}
               onAsk={ask}
               onRequestUpload={onRequestUpload}
@@ -339,18 +339,17 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
 
 function EmptyChat({
   documents,
-  readyCount,
   latestReadyName,
   onAsk,
   onRequestUpload,
 }: {
   documents: DocumentDTO[] | null;
-  readyCount: number;
   latestReadyName: string | undefined;
   onAsk: (question: string) => void;
   onRequestUpload: () => void;
 }) {
-  const hasDocuments = (documents?.length ?? 0) > 0;
+  const readiness = documentReadiness(documents);
+  const documentCount = documents?.length ?? 0;
   const suggestions = [
     "Dokumen apa saja yang sudah saya upload?",
     latestReadyName ? `Ringkas dokumen ${latestReadyName}` : "Ringkas dokumen yang saya upload",
@@ -361,14 +360,20 @@ function EmptyChat({
     <div className="mx-auto flex min-h-full w-full max-w-xl flex-col items-center justify-center px-6 py-12 text-center">
       <div aria-hidden="true" className="relative">
         <span className="grid size-14 place-items-center rounded-2xl border border-zinc-200 bg-white text-zinc-500 shadow-sm dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
-          {hasDocuments ? <MessagesSquare className="size-6" /> : <FileSearch className="size-6" />}
+          {readiness === "all_failed" ? (
+            <TriangleAlert className="size-6" />
+          ) : documentCount > 0 ? (
+            <MessagesSquare className="size-6" />
+          ) : (
+            <FileSearch className="size-6" />
+          )}
         </span>
         <span className="absolute -top-1 -right-1 size-3 rounded-full bg-accent-500 ring-4 ring-white dark:ring-zinc-950" />
       </div>
 
-      {documents === null ? (
+      {readiness === "loading" ? (
         <p className="mt-5 text-sm text-zinc-500 dark:text-zinc-400">Memuat dokumen…</p>
-      ) : !hasDocuments ? (
+      ) : readiness === "none" ? (
         <>
           <h3 className="mt-5 text-base font-semibold tracking-tight">Upload dokumen untuk mulai bertanya</h3>
           <p className="mt-2 max-w-sm text-sm leading-6 text-zinc-500 dark:text-zinc-400">
@@ -380,11 +385,28 @@ function EmptyChat({
             Upload dokumen
           </Button>
         </>
+      ) : readiness === "all_failed" ? (
+        <>
+          <h3 className="mt-5 text-base font-semibold tracking-tight">
+            {documentCount === 1 ? "Dokumenmu gagal diproses" : "Semua dokumenmu gagal diproses"}
+          </h3>
+          <p className="mt-2 max-w-sm text-sm leading-6 text-zinc-500 dark:text-zinc-400">
+            Belum ada dokumen yang bisa ditanya. Lihat alasannya di daftar dokumen, lalu hapus &amp; upload ulang
+            file yang sudah diperbaiki.
+          </p>
+          {/* Sesi penuh → upload baru pasti ditolak; user harus menghapus dulu di daftar dokumen. */}
+          {documentCount < MAX_FILES_PER_SESSION && (
+            <Button variant="secondary" className="mt-6" onClick={onRequestUpload}>
+              <Upload aria-hidden="true" />
+              Upload dokumen lain
+            </Button>
+          )}
+        </>
       ) : (
         <>
           <h3 className="mt-5 text-base font-semibold tracking-tight">Tanya apa saja tentang dokumenmu</h3>
           <p className="mt-2 max-w-sm text-sm leading-6 text-zinc-500 dark:text-zinc-400">
-            {readyCount > 0
+            {readiness === "ready"
               ? "Pilih pertanyaan contoh di bawah, atau ketik sendiri. Klik nomor sitasi untuk melihat potongan aslinya."
               : "Dokumen sedang diproses — sebentar lagi siap ditanya."}
           </p>
@@ -394,7 +416,7 @@ function EmptyChat({
                 <button
                   type="button"
                   onClick={() => onAsk(suggestion)}
-                  disabled={readyCount === 0}
+                  disabled={readiness !== "ready"}
                   className={cx(
                     "w-full truncate rounded-xl border border-zinc-200 bg-white px-4 py-2.5 text-left text-sm text-zinc-700 shadow-xs transition-colors",
                     "hover:border-accent-300 hover:bg-accent-50/50 hover:text-zinc-900 disabled:pointer-events-none disabled:opacity-50",

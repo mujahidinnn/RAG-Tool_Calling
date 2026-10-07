@@ -82,6 +82,11 @@ js-tiktoken.
   375px.
 - Empty state + CTA upload, skeleton/spinner per dokumen yang diproses, progress bar
   upload, error state dengan tombol "Coba lagi".
+- Dokumen `failed` menampilkan pesan dari server, yang sudah membawa saran sesuai
+  penyebabnya (scan, terlalu panjang, limit harian, …), plus tombol "Hapus & upload ulang".
+  File pengganti baru dikirim setelah penghapusan selesai, jadi slot yang sedang dikosongkan
+  tidak dihitung terpakai. Empty state chat membedakan "dokumen masih diproses" dari "semua
+  dokumen gagal".
 - Dark mode mengikuti sistem. Animasi menghormati `prefers-reduced-motion`.
 - Aksesibilitas: Enter kirim / Shift+Enter baris baru, focus ring terlihat, area jawaban
   `aria-live="polite"`, semua tombol ikon punya `aria-label`.
@@ -307,8 +312,9 @@ lain-lain.
 │   └── supabase/
 │       ├── client.ts                # client service role (server-only, lazy)
 │       └── schema.sql               # tabel, fungsi RPC, RLS, bucket Storage
-├── tests/                           # 22 file node:test (npm test)
+├── tests/                           # 23 file node:test (npm test)
 ├── proxy.ts                         # (pengganti middleware di Next 16) cookie sesi di "/"
+├── instrumentation.ts               # baca env saat server start → peringatan konfigurasi di log
 ├── next.config.ts                   # cacheComponents + loader Tailwind untuk Turbopack
 ├── .env.example
 ├── AGENTS.md
@@ -596,11 +602,27 @@ adalah rem ringan, dan **budget harian di database adalah batas kerasnya**.
   `DEMO_PASSCODE` membuat semua cookie lama tidak berlaku. Token **terikat ke session id**:
   klien tidak bisa menyimpan cookie auth lalu membuang cookie sesi di tiap request untuk
   mendapat kuota baru, karena sesi baru wajib login ulang lewat limiter.
-- Rem brute-force berlapis: 5 percobaan/menit per sesi, 20/menit per IP (kalau IP bisa
-  dipercaya), dan **30 passcode salah/menit secara global**. Limiter global tidak bisa diakali
-  dengan berganti cookie atau memalsukan header IP. Harganya: selama ada serangan, login baru
-  tertahan ≤1 menit, sedangkan user yang sudah login tidak terganggu.
-- Server memberi peringatan di log kalau `DEMO_PASSCODE` kurang dari 12 karakter.
+- Rem brute-force berlapis:
+  - **Per IP, 20 percobaan/menit: rem utama.** Brute-force hanya bisa direm kalau penebaknya
+    bisa dikenali, dan IP satu-satunya identitas yang tidak bisa diganti gratis. IP hanya
+    dipercaya di Vercel atau kalau `TRUSTED_PROXY_HOPS` di-set (lihat di bawah).
+  - Per sesi, 5 percobaan/menit. Mudah diakali dengan membuang cookie, tapi menahan user
+    biasa yang salah ketik berulang-ulang.
+  - **Plafon global 300 passcode salah/menit** dari semua klien. Plafon ini sengaja tinggi.
+    Limiter tanpa identitas ikut menahan user yang sah (login baru semua orang mendapat 429
+    selama plafon penuh), jadi kalau batasnya rendah, penebak anonim yang mengirim beberapa
+    tebakan per detik bisa mengunci login semua orang selama dia mau. Plafon hanya untuk
+    tebakan masif (botnet).
+  - Body dibaca dulu, lalu cek limiter → cek passcode → catat passcode salah berjalan
+    tanpa `await` di antaranya. Dengan begitu request paralel tidak bisa sama-sama lolos
+    plafon sebelum ada yang tercatat.
+- **Trade-off yang tersisa:** kalau IP tidak bisa dipercaya (self-host tanpa
+  `TRUSTED_PROXY_HOPS`), satu klien yang mengirim > 5 passcode salah/detik tetap bisa membuat
+  login baru tertahan selama serangannya berlangsung. User yang sudah login tidak terganggu.
+  Di Vercel / dengan `TRUSTED_PROXY_HOPS`, penyerang butuh ≥15 IP (300 ÷ 20) untuk itu.
+  Plafon 300/menit tetap tidak berarti untuk passcode acak ≥12 karakter (±10²¹ kemungkinan),
+  jadi **pertahanan sebenarnya adalah panjang passcode**. Server menulis peringatan di log saat
+  start (tanpa menulis nilainya) kalau `DEMO_PASSCODE` kurang dari 12 karakter.
 
 ### 2. Rate limit (in-memory)
 
@@ -610,8 +632,8 @@ adalah rem ringan, dan **budget harian di database adalah batas kerasnya**.
 | `chatIpRateLimiter` | IP tepercaya | 120/menit | `/api/chat` |
 | `uploadIpRateLimiter` | IP tepercaya | 30/menit | `/api/upload` |
 | `passcodeRateLimiter` | session id | 5/menit | `POST /api/auth` |
-| `passcodeIpRateLimiter` | IP tepercaya | 20/menit | `POST /api/auth` |
-| `passcodeFailureLimiter` | 1 key global | 30 salah/menit | `POST /api/auth` |
+| `passcodeIpRateLimiter` | IP tepercaya | 20/menit (rem utama) | `POST /api/auth` |
+| `passcodeFailureLimiter` | 1 key global | 300 salah/menit (plafon) | `POST /api/auth` |
 
 Algoritmanya sliding window log (`lib/server/rateLimit.ts`). Request yang ditolak tidak
 dicatat, jadi klien yang terus mencoba tetap dibatasi `max` per window dan tidak terkunci
@@ -620,7 +642,8 @@ lebih longgar karena satu kelas bisa berbagi 1 IP (NAT).
 
 **IP mana yang dipercaya?** `X-Forwarded-For` bisa diisi klien sendiri, dan `next start` tanpa
 proxy meneruskannya apa adanya. Karena itu header IP **tidak dipercaya secara default**
-(limiter per IP dilewati, limiter per sesi & global tetap jalan). Header IP dipercaya kalau:
+(limiter per IP dilewati, limiter per sesi & plafon global tetap jalan, dengan trade-off
+passcode di atas). Header IP dipercaya kalau:
 
 - app berjalan di **Vercel** (env `VERCEL` terisi otomatis; platform menimpa header IP), atau
 - `TRUSTED_PROXY_HOPS=N` di-set: IP diambil dari entri ke-N **dari kanan** (dari kiri bisa
@@ -711,11 +734,11 @@ Detail lain:
 | Proxy mem-buffer body | `proxy.ts` hanya aktif di `/`, tidak di `/api`, supaya penghitungan byte di `/api/upload` tetap streaming. |
 | Ekstensi / Content-Type palsu | Tipe ditentukan dari **isi** (`detectFileType`): `.pdf` wajib diawali `%PDF-`; `.md`/`.txt` wajib UTF-8 valid (`TextDecoder` fatal), tanpa byte NUL, karakter kontrol ≤1%, dan **bukan** PDF yang diganti ekstensinya. `Content-Type` dari browser hanya informasi. |
 | Path traversal / menimpa file orang lain | Storage path = `crypto.randomUUID()` buatan server, **sama** dengan `documents.id`. Nama file asli tidak pernah jadi path. |
-| Nama file berbahaya | `sanitizeFilename`: buang bagian path (`../../etc/passwd` → `passwd`), karakter kontrol & pembalik arah teks, `[ ] " < >` (merusak sintaks sitasi / pembungkus context), maks 120 karakter. Nama kembar dalam 1 sesi jadi `nama (2).pdf`, supaya sitasi tidak ambigu. |
-| Upload paralel melewati batas 5 file | RPC `create_document`: count + insert di bawah `pg_advisory_xact_lock` per sesi (atomic). Batas global 100 dokumen di seluruh server melindungi kuota database. |
+| Nama file berbahaya | `sanitizeFilename`: buang bagian path (`../../etc/passwd` → `passwd`), karakter kontrol & pembalik arah teks, `[ ] " < >` (merusak sintaks sitasi / pembungkus context), maks 120 karakter. Nama kembar dalam 1 sesi jadi `nama (2).pdf`, supaya sitasi tidak ambigu. Penomoran hanya di `create_document`, di bawah lock per sesi: route mengirim nama apa adanya, jadi upload paralel bernama sama tidak mendapat nomor dobel. Nomor dobel hanya muncul kalau user sendiri mengupload nama yang sudah bernomor dan bentrok (`x (2).txt` → `x (2) (2).txt`). |
+| Upload paralel melewati batas 5 file | RPC `create_document`: count + penomoran nama + insert di bawah `pg_advisory_xact_lock` per sesi (atomic). Cek jumlah di route hanya jalur cepat sebelum body dibaca. Batas global 100 dokumen di seluruh server melindungi kuota database. |
 | Crash di antara Storage dan database | Urutan: upload Storage → `create_document`. Kalau RPC gagal, file dihapus. Kalau fungsi mati di antaranya, sweep "file yatim" di cleanup menghapusnya. |
 | PDF kecil berisi jutaan karakter / file teks raksasa | Ekstraksi berhenti di 2 juta karakter (PDF dibaca per halaman, jadi berhenti lebih awal); PDF maks 500 halaman, timeout 30 detik, gambar raksasa tidak di-decode; tokenisasi berhenti begitu lewat **150 ribu token**; "kata" > 24 byte dipotong sebelum BPE (mencegah O(n²)). |
-| PDF hasil scan (tanpa teks) | `failed` dengan pesan "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar)." Deteksinya mengabaikan baris yang hanya nomor halaman dan baris yang berulang di ≥ separuh halaman (watermark "Scanned with …"), lalu mewajibkan ≥ max(20, 25 × jumlah halaman) huruf/angka. |
+| PDF hasil scan (tanpa teks) | `failed` dengan pesan "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar). Upload versi PDF yang teksnya bisa diseleksi." Deteksinya mengabaikan baris yang hanya nomor halaman dan baris yang berulang di ≥ separuh halaman (watermark "Scanned with …"), lalu mewajibkan ≥ max(20, 25 × jumlah halaman) huruf/angka. |
 | Lapisan kedua | Bucket `documents` **private** dengan `file_size_limit` 5 MB dan `allowed_mime_types` (dibuat oleh `schema.sql`). |
 
 Pemrosesan berat (extract → chunk → embed) berjalan di `after()`, jadi user langsung
@@ -791,7 +814,7 @@ terhapus lewat cascade).
 | Model `claude-sonnet-5` / `gpt-5` | `claude-sonnet-5-5` / `gpt-5.6-terra` | Spec meminta menyesuaikan dengan model terbaru saat dikerjakan. |
 | Upload (format tidak disebut) | Raw body + header `X-Filename` | Supaya byte bisa dihitung langsung dari stream request. |
 | Batas hanya 5 MB & 5 file | + 150 ribu token/dokumen, 2 juta karakter, 500 halaman PDF, 100 dokumen global | Ukuran file tidak membatasi isi: PDF 300 KB terkompresi bisa berisi puluhan juta karakter. |
-| Auth cukup "cek passcode" | Cookie auth = HMAC terikat session id + limiter global passcode salah | Mencegah trik "buang cookie sesi untuk kuota baru" dan brute-force dengan IP palsu. |
+| Auth cukup "cek passcode" | Cookie auth = HMAC terikat session id + limiter passcode per IP + plafon global passcode salah | Mencegah trik "buang cookie sesi untuk kuota baru". Plafon global sengaja tinggi supaya penebak anonim tidak bisa mengunci login orang lain. |
 
 ---
 
@@ -871,13 +894,14 @@ dan string token spesial tidak merusak hasil.
 Semua variabel hanya dibaca di server (`lib/env.ts`, `server-only`). Tidak ada
 `NEXT_PUBLIC_*` dan tidak ada anon key. Nilai kosong dianggap belum di-set. Env yang wajib
 tapi kosong menghasilkan `ConfigError` dengan daftar nama variabel yang kurang (tanpa nilai
-secret). Env di-cache saat pertama dibaca, jadi **perubahan butuh restart server**.
+secret). Env dibaca saat server start (`instrumentation.ts`), jadi peringatan konfigurasi
+langsung muncul di log. Setelah itu env di-cache, jadi **perubahan butuh restart server**.
 
 | Variabel | Wajib? | Default | Fungsi |
 | --- | --- | --- | --- |
 | `SUPABASE_URL` | ya | | URL project Supabase (`https://xxxx.supabase.co` atau `http://127.0.0.1:54321`) |
 | `SUPABASE_SERVICE_ROLE_KEY` | ya | | Service role key: bypass RLS, hanya untuk server |
-| `DEMO_PASSCODE` | ya | | Passcode gerbang demo. Pakai ≥12 karakter acak (di bawah itu server memberi peringatan) |
+| `DEMO_PASSCODE` | ya | | Passcode gerbang demo. Pakai ≥12 karakter acak (di bawah itu server memberi peringatan saat start). Ini pertahanan utama brute-force kalau IP klien tidak bisa dipercaya |
 | `OPENAI_API_KEY` | ya, praktisnya | | Embedding (upload & retrieval, apa pun provider chat-nya) + chat GPT |
 | `ANTHROPIC_API_KEY` | opsional | | Chat Claude. Kosong = Claude tetap muncul di dropdown dengan tanda "(API key belum di-set)" dan request-nya ditolak dengan error jelas |
 | `DEFAULT_LLM_PROVIDER` | opsional | `anthropic` | Pilihan awal dropdown (`anthropic` \| `openai`) |
@@ -1015,7 +1039,8 @@ Query SQL di bawah dijalankan di SQL Editor Supabase.
   ```
 
 - [ ] **PDF hasil scan.** Upload PDF berisi gambar saja (mis. hasil scan HP) → status `failed`
-  dengan "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar)."
+  dengan "Tidak ada teks terbaca di file ini (mungkin PDF hasil scan/gambar). Upload versi PDF
+  yang teksnya bisa diseleksi."
 
 ---
 
@@ -1060,6 +1085,10 @@ membuat badge biaya dan daily cap ikut salah.
   dokumennya terhapus otomatis setelah 24 jam.
 - **Bukan auth sungguhan.** Siapa pun yang memegang passcode bisa memakai demo. Isolasi hanya
   per cookie sesi.
+- **Tanpa IP tepercaya, rem brute-force tidak bisa mengenali penebak.** Satu klien yang mengirim
+  > 5 passcode salah/detik bisa membuat login baru tertahan selama serangannya berlangsung
+  (lihat [gerbang passcode](#1-gerbang-passcode)). Set `TRUSTED_PROXY_HOPS` di self-host, dan
+  pakai passcode acak ≥12 karakter.
 - **Tidak ada OCR.** PDF hasil scan ditolak, tidak dibaca.
 - **Batas isi dokumen:** maks ±150 ribu token (±200 halaman teks padat) dan 500 halaman PDF.
   Ringkasan dokumen panjang memakai sampel merata maks 24 chunk (12 ribu token), bukan seluruh

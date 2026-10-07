@@ -204,8 +204,10 @@ comment on function public.match_chunks(vector, int, uuid) is
 -- Advisory lock per sesi membuat count+insert untuk sesi yang sama antre satu
 -- per satu; sesi lain tidak ikut menunggu.
 -- Di bawah lock yang sama, nama file dibuat unik per sesi ("a.pdf" →
--- "a (2).pdf"): sitasi [nama_file, chunk #n] harus menunjuk tepat 1 dokumen,
--- dan cek nama di route (sebelum upload body yang lama) tidak atomic.
+-- "a (2).pdf"): sitasi [nama_file, chunk #n] harus menunjuk tepat 1 dokumen.
+-- Penomoran HANYA di sini — route mengirim nama apa adanya; kalau route ikut
+-- menomori dari daftar yang dibacanya sendiri (tidak atomic), upload paralel
+-- bernama sama dapat nomor dobel.
 -- p_max_total_docs (opsional) = batas dokumen di SELURUH server: sesi baru
 -- mudah dibuat, jadi batas per sesi saja tidak melindungi kuota database.
 -- Versi lama fungsi ini (7 parameter) dibuang supaya tidak jadi overload ganda.
@@ -273,8 +275,10 @@ begin
             detail = format('Sesi ini sudah punya %s dokumen (maks %s).', v_count, p_max_docs);
   end if;
 
-  -- Ekstensi dipisah dengan aturan yang sama seperti uniqueFilename() di
-  -- lib/server/upload.ts: /\.[a-z0-9]{1,10}$/i.
+  -- Ekstensi dipisah dengan aturan yang sama seperti sanitizeFilename() di
+  -- lib/server/upload.ts: /\.[a-z0-9]{1,10}$/i. Nomor dicari sampai nama
+  -- belum dipakai, jadi hasilnya selalu unik — termasuk kalau user sendiri
+  -- mengupload "x (2).txt" (bentrok dengan nama itu → "x (2) (2).txt").
   v_ext := coalesce(substring(p_filename from '\.[A-Za-z0-9]{1,10}$'), '');
   v_base := left(p_filename, length(p_filename) - length(v_ext));
   v_filename := p_filename;

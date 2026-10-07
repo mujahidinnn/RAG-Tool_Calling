@@ -6,7 +6,6 @@ import {
   getAllowedExtension,
   readStreamWithLimit,
   sanitizeFilename,
-  uniqueFilename,
 } from "@/lib/server/upload";
 
 const encoder = new TextEncoder();
@@ -197,14 +196,5 @@ describe("sanitizeFilename", () => {
     assert.equal(sanitizeFilename(""), "dokumen");
     assert.equal(sanitizeFilename("   "), "dokumen");
     assert.equal(sanitizeFilename("[]"), "dokumen");
-  });
-});
-
-describe("uniqueFilename", () => {
-  test("nama kembar diberi nomor", () => {
-    assert.equal(uniqueFilename("a.pdf", []), "a.pdf");
-    assert.equal(uniqueFilename("a.pdf", ["A.PDF"]), "a (2).pdf");
-    assert.equal(uniqueFilename("a.pdf", ["a.pdf", "a (2).pdf"]), "a (3).pdf");
-    assert.equal(uniqueFilename("catatan", ["catatan"]), "catatan (2)");
   });
 });
