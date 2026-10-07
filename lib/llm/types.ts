@@ -53,6 +53,13 @@ export type ChatOptions = {
   system?: string;
   /** Default: MAX_OUTPUT_TOKENS dari lib/config.ts. */
   maxOutputTokens?: number;
+  /**
+   * "none" = model DILARANG memanggil tool di panggilan ini (dipakai di ronde
+   * terakhir loop tool). Tools tetap dikirim: Anthropic menolak riwayat berisi
+   * tool_use/tool_result tanpa `tools`, jadi cara mematikan tool yang benar
+   * adalah tool_choice "none", bukan menghapus definisi tools. Default "auto".
+   */
+  toolChoice?: "auto" | "none";
   /** Dibatalkan saat client menutup koneksi. */
   signal?: AbortSignal;
 };
