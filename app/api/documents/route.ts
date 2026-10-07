@@ -46,6 +46,7 @@ export async function DELETE(request: Request): Promise<Response> {
   try {
     const auth = await requireSession();
     if (!auth.ok) return auth.response;
+    after(() => maybeCleanupExpired());
 
     const id = new URL(request.url).searchParams.get("id") ?? "";
     if (!isValidUuid(id)) return jsonError(400, "bad_request", "ID dokumen tidak valid.");

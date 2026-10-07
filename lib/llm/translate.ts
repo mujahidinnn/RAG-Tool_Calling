@@ -66,11 +66,22 @@ function isToolResultTurn(turn: AnthropicTurn | undefined): boolean {
  *   harus bergantian) dan blok teks kosong dibuang (API menolak teks kosong).
  * - Giliran pertama harus `user`: giliran assistant di awal (mis. riwayat
  *   yang terpotong di tengah) dibuang.
- * - Blok `thinking` tidak dibawa di riwayat generik kita. API menerima
- *   riwayat tanpa thinking — yang hilang hanya penalaran giliran itu.
+ * - Riwayat dari UI hanya berisi teks (tanpa blok `thinking`) — API
+ *   menerimanya. Tapi DI DALAM 1 loop tool, pesan assistant yang membawa
+ *   `replay` dikirim sebagai giliran asli Claude apa adanya (thinking +
+ *   tanda tangan + teks + tool_use, urutan asli): dokumentasi Claude meminta
+ *   blok thinking dikirim balik tanpa diubah selama loop tool. Pesan `tool`
+ *   yang tool_use-nya sudah ada di giliran replay itu hanya menambah tool_result.
+ * - Tool yang gagal (`isError`) dikirim dengan `is_error: true`, sinyal
+ *   kegagalan resmi yang dikenali model (dokumentasi tool use Claude).
  */
 export function toAnthropicMessages(messages: Message[]): MessageParam[] {
   const turns: AnthropicTurn[] = [];
+  // tool_use id yang sudah dikirim lewat giliran replay.
+  const replayedToolIds = new Set<string>();
+  // Giliran replay tidak boleh ditambahi blok lain: isinya terikat tanda
+  // tangan thinking, dan ronde berikutnya adalah giliran terpisah.
+  const sealedTurns = new WeakSet<AnthropicTurn>();
 
   const lastTurn = (): AnthropicTurn | undefined => turns[turns.length - 1];
   const turnFor = (role: AnthropicTurn["role"]): AnthropicTurn => {
@@ -83,7 +94,18 @@ export function toAnthropicMessages(messages: Message[]): MessageParam[] {
 
   for (const message of messages) {
     if (message.role === "tool") {
-      appendAnthropicToolMessage(turns, message, turnFor);
+      if (replayedToolIds.has(message.toolCallId)) appendToolResultOnly(turns, message);
+      else appendAnthropicToolMessage(turns, message, turnFor, sealedTurns);
+      continue;
+    }
+    if (message.role === "assistant" && message.replay?.provider === "anthropic") {
+      // Giliran asli — `content` (teksnya) sudah termasuk di dalam blok replay.
+      for (const block of message.replay.blocks) {
+        if (block.type === "tool_use") replayedToolIds.add(block.id);
+      }
+      const turn = turnFor("assistant");
+      turn.blocks.push(...message.replay.blocks);
+      sealedTurns.add(turn);
       continue;
     }
     if (message.content.trim() === "") continue;
@@ -106,6 +128,7 @@ function appendAnthropicToolMessage(
   turns: AnthropicTurn[],
   message: ToolMessage,
   turnFor: (role: AnthropicTurn["role"]) => AnthropicTurn,
+  sealedTurns: WeakSet<AnthropicTurn>,
 ): void {
   const toolUse: ContentBlockParam = {
     type: "tool_use",
@@ -113,15 +136,11 @@ function appendAnthropicToolMessage(
     name: message.toolName,
     input: toToolInputObject(message.input),
   };
-  const toolResult: ContentBlockParam = {
-    type: "tool_result",
-    tool_use_id: message.toolCallId,
-    content: message.content,
-  };
+  const toolResult = toAnthropicToolResult(message);
 
   const last = turns[turns.length - 1];
   const beforeLast = turns[turns.length - 2];
-  if (isToolResultTurn(last) && beforeLast?.role === "assistant") {
+  if (isToolResultTurn(last) && beforeLast?.role === "assistant" && !sealedTurns.has(beforeLast)) {
     // Lanjutan batch paralel: panggilan masuk ke assistant yang sama,
     // hasilnya ke pesan user yang sama.
     beforeLast.blocks.push(toolUse);
@@ -130,6 +149,23 @@ function appendAnthropicToolMessage(
   }
   turnFor("assistant").blocks.push(toolUse);
   turns.push({ role: "user", blocks: [toolResult] });
+}
+
+function toAnthropicToolResult(message: ToolMessage): ContentBlockParam {
+  return {
+    type: "tool_result",
+    tool_use_id: message.toolCallId,
+    content: message.content,
+    ...(message.isError ? { is_error: true } : {}),
+  };
+}
+
+/** Hasil tool untuk tool_use yang sudah ada di giliran replay: hanya tool_result. */
+function appendToolResultOnly(turns: AnthropicTurn[], message: ToolMessage): void {
+  const last = turns[turns.length - 1];
+  // Hasil paralel dari 1 giliran → 1 pesan user yang sama.
+  if (isToolResultTurn(last)) last.blocks.push(toAnthropicToolResult(message));
+  else turns.push({ role: "user", blocks: [toAnthropicToolResult(message)] });
 }
 
 /**
@@ -161,6 +197,8 @@ export function toAnthropicTools(tools: Tool[]): AnthropicTool[] {
  * - System prompt dikirim sebagai pesan role `developer`: untuk model
  *   reasoning OpenAI (o1 ke atas, termasuk keluarga GPT-5), `developer`
  *   menggantikan `system` (lihat dokumentasi tipe di SDK openai).
+ * - `replay` (khusus Anthropic) diabaikan; `isError` tidak punya padanan di
+ *   OpenAI — pesan error-nya sudah ada di `content`.
  * - Pesan `tool` → `tool_calls` pada pesan assistant (dibuat kalau belum ada;
  *   ditempel ke assistant teks tepat sebelumnya) diikuti pesan
  *   `{ role: "tool", tool_call_id, content }`. Pesan tool berurutan (paralel)

@@ -11,6 +11,24 @@ export const STORAGE_BUCKET = "documents";
 export const MIN_EXTRACTED_CHARS = 20;
 /** Dokumen + chunk lebih tua dari ini dihapus otomatis. */
 export const DOCUMENT_TTL_HOURS = 24;
+/**
+ * Batas 5 MB TIDAK membatasi isi: PDF 300 KB terkompresi bisa berisi puluhan
+ * juta karakter, dan .txt 5 MB berisi angka pendek = jutaan token. Tanpa batas
+ * isi, 1 upload bisa melewati maxDuration, menyedot embedding, membekukan
+ * event loop (tokenizer sinkron), dan memenuhi database.
+ * - MAX_EXTRACTED_CHARS: ekstraksi berhenti di sini (pengaman memori/waktu).
+ * - MAX_DOCUMENT_TOKENS: ±150 ribu token ≈ 200 halaman teks padat ≈ 330 chunk
+ *   (±2,8 MB baris pgvector, ±2 putaran embedding).
+ */
+export const MAX_EXTRACTED_CHARS = 2_000_000;
+export const MAX_DOCUMENT_TOKENS = 150_000;
+/**
+ * Batas dokumen tersimpan di SELURUH server (semua sesi). Sesi baru mudah
+ * dibuat, jadi batas per sesi saja tidak melindungi kuota database (free tier
+ * Supabase 500 MB): 100 × dokumen terbesar ≈ 280 MB. Dokumen lama terhapus
+ * otomatis setelah DOCUMENT_TTL_HOURS.
+ */
+export const MAX_TOTAL_DOCUMENTS = 100;
 
 // --- RAG ------------------------------------------------------------------
 export const CHUNK_TOKENS = 500;

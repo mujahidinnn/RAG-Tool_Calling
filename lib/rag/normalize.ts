@@ -36,3 +36,49 @@ export function hasEnoughReadableText(text: string, minChars: number): boolean {
   }
   return minChars <= 0;
 }
+
+/** Huruf/angka minimal per halaman PDF supaya tidak dianggap hasil scan. */
+export const MIN_READABLE_CHARS_PER_PDF_PAGE = 25;
+
+/** Baris yang hanya berisi angka/tanda baca/simbol: nomor halaman, stempel Bates "000123", garis. */
+const NON_TEXT_LINE = /^[\p{N}\p{P}\p{S}\s]*$/u;
+
+/**
+ * Jumlah huruf/angka "bermakna" di teks PDF, TANPA:
+ * - baris yang hanya nomor/tanda baca (nomor halaman, stempel),
+ * - baris yang berulang di banyak halaman (watermark "Scanned with
+ *   CamScanner", header/footer berjalan).
+ * PDF hasil scan sering tetap punya lapisan teks berisi hal-hal itu saja.
+ * Hanya untuk keputusan "ada teks terbaca?" — teks yang di-chunk tidak diubah.
+ */
+export function countMeaningfulPdfChars(text: string, pageCount: number): number {
+  const lines = text
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line !== "" && !NON_TEXT_LINE.test(line));
+
+  const occurrences = new Map<string, number>();
+  for (const line of lines) {
+    const key = line.toLowerCase();
+    occurrences.set(key, (occurrences.get(key) ?? 0) + 1);
+  }
+  // "Berulang" = muncul di ≥ separuh halaman (minimal 2x); PDF 1 halaman tidak dicek.
+  const repeatedAt = Math.max(2, Math.ceil(pageCount / 2));
+
+  let count = 0;
+  for (const line of lines) {
+    if (pageCount >= 2 && (occurrences.get(line.toLowerCase()) ?? 0) >= repeatedAt) continue;
+    count += line.match(/[\p{L}\p{N}]/gu)?.length ?? 0;
+  }
+  return count;
+}
+
+/**
+ * Cek "ada teks terbaca?" untuk PDF, RELATIF terhadap jumlah halaman: 239
+ * huruf dari watermark di 10 halaman scan bukan dokumen yang bisa ditanya.
+ * Ambang per halaman sengaja rendah supaya slide deck yang jarang teksnya lolos.
+ */
+export function hasEnoughReadablePdfText(text: string, pageCount: number, minChars: number): boolean {
+  const needed = Math.max(minChars, MIN_READABLE_CHARS_PER_PDF_PAGE * Math.max(1, pageCount));
+  return countMeaningfulPdfChars(text, pageCount) >= needed;
+}

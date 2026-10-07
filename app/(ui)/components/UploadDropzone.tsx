@@ -10,8 +10,10 @@ type Props = {
   /** "hero" = empty state besar (belum ada dokumen); "compact" = baris kecil di atas daftar. */
   variant: "hero" | "compact";
   disabled: boolean;
+  /** true = daftar dokumen masih dimuat (disabled karena itu, BUKAN karena batas tercapai). */
+  loading?: boolean;
   onFiles: (files: File[]) => void;
-  /** Dipakai AppShell untuk membuka file picker dari CTA di panel chat. */
+  /** <input type="file"> dari FileInput — dirender sekali oleh DocumentList. */
   inputRef: RefObject<HTMLInputElement | null>;
 };
 
@@ -23,7 +25,44 @@ function hasFiles(event: { dataTransfer: DataTransfer | null }): boolean {
   return event.dataTransfer?.types.includes("Files") ?? false;
 }
 
-export function UploadDropzone({ variant, disabled, onFiles, inputRef }: Props) {
+/**
+ * <input type="file"> tersembunyi yang dibuka lewat `inputRef.current.click()`
+ * (tombol upload, CTA di panel chat, "Hapus & upload ulang").
+ *
+ * Sengaja TERPISAH dari dropzone dan dirender sekali di DocumentList: dropzone
+ * berganti hero ↔ compact saat daftar kosong/terisi. Kalau input ikut
+ * di-unmount saat file picker masih terbuka (mis. dokumen terakhir dihapus),
+ * event change dari elemen yang sudah lepas tidak pernah sampai ke React.
+ */
+export function FileInput({
+  inputRef,
+  onFiles,
+}: {
+  inputRef: RefObject<HTMLInputElement | null>;
+  onFiles: (files: File[]) => void;
+}) {
+  const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    // Reset supaya memilih file yang sama lagi tetap memicu onChange.
+    event.target.value = "";
+    if (files.length > 0) onFiles(files);
+  };
+
+  return (
+    <input
+      ref={inputRef}
+      type="file"
+      multiple
+      accept={ACCEPT}
+      className="hidden"
+      tabIndex={-1}
+      aria-hidden="true"
+      onChange={handleChange}
+    />
+  );
+}
+
+export function UploadDropzone({ variant, disabled, loading = false, onFiles, inputRef }: Props) {
   const [dragDepth, setDragDepth] = useState(0);
   const dragging = dragDepth > 0 && !disabled;
 
@@ -41,13 +80,8 @@ export function UploadDropzone({ variant, disabled, onFiles, inputRef }: Props) 
     };
   }, []);
 
-  const openPicker = () => inputRef.current?.click();
-
-  const handleChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? []);
-    // Reset supaya memilih file yang sama lagi tetap memicu onChange.
-    event.target.value = "";
-    if (files.length > 0) onFiles(files);
+  const openPicker = () => {
+    if (!disabled) inputRef.current?.click();
   };
 
   // dragenter/dragleave juga terpicu saat kursor melewati elemen anak →
@@ -78,18 +112,6 @@ export function UploadDropzone({ variant, disabled, onFiles, inputRef }: Props) 
 
   return (
     <div className="space-y-2.5">
-      <input
-        ref={inputRef}
-        type="file"
-        multiple
-        accept={ACCEPT}
-        className="hidden"
-        tabIndex={-1}
-        aria-hidden="true"
-        onChange={handleChange}
-        disabled={disabled}
-      />
-
       {variant === "hero" ? (
         <div
           {...dropHandlers}
@@ -139,14 +161,16 @@ export function UploadDropzone({ variant, disabled, onFiles, inputRef }: Props) 
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-sm font-medium text-zinc-800 dark:text-zinc-200">
-              {disabled
-                ? `Batas ${MAX_FILES_PER_SESSION} dokumen tercapai`
-                : dragging
-                  ? "Lepas untuk mengupload"
-                  : "Upload dokumen"}
+              {loading
+                ? "Memuat daftar dokumen…"
+                : disabled
+                  ? `Batas ${MAX_FILES_PER_SESSION} dokumen tercapai`
+                  : dragging
+                    ? "Lepas untuk mengupload"
+                    : "Upload dokumen"}
             </span>
             <span className="block truncate text-[0.6875rem] text-zinc-500 dark:text-zinc-400">
-              {disabled ? "Hapus salah satu dokumen untuk upload lagi." : LIMITS_TEXT}
+              {disabled && !loading ? "Hapus salah satu dokumen untuk upload lagi." : LIMITS_TEXT}
             </span>
           </span>
         </button>

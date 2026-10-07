@@ -8,7 +8,7 @@ import { Tiktoken } from "js-tiktoken/lite";
 import cl100k_base from "js-tiktoken/ranks/cl100k_base";
 
 import { CHUNK_OVERLAP_TOKENS, CHUNK_TOKENS } from "@/lib/config";
-import { chunkText, countTokens, splitTokens, type TextChunk } from "@/lib/rag/chunk";
+import { DocumentTooLongError, chunkText, countTokens, splitTokens, type TextChunk } from "@/lib/rag/chunk";
 
 // --- Helper ------------------------------------------------------------------
 
@@ -292,5 +292,29 @@ describe("countTokens", () => {
     for (const sample of samples) {
       assert.equal(countTokens(sample), reference.encode(sample, [], []).length);
     }
+  });
+});
+
+describe("chunkText — batas token dokumen (maxTokens)", () => {
+  const long = "Kalimat contoh tentang kebijakan cuti karyawan. ".repeat(2000);
+
+  test("melebihi maxTokens → DocumentTooLongError (sebelum chunking)", () => {
+    assert.throws(() => chunkText(long, { maxTokens: 1000 }), (err: unknown) => {
+      assert.ok(err instanceof DocumentTooLongError);
+      assert.equal(err.maxTokens, 1000);
+      return true;
+    });
+  });
+
+  test("tepat di bawah batas → tetap di-chunk seperti biasa", () => {
+    const total = countTokens(long);
+    assert.deepEqual(chunkText(long, { maxTokens: total }), chunkText(long));
+  });
+
+  test("berhenti cepat: teks raksasa ditolak tanpa meng-encode seluruhnya", () => {
+    const huge = "kata ".repeat(2_000_000); // ±10 juta karakter
+    const started = Date.now();
+    assert.throws(() => chunkText(huge, { maxTokens: 5_000 }), DocumentTooLongError);
+    assert.ok(Date.now() - started < 2_000, `terlalu lama: ${Date.now() - started} ms`);
   });
 });

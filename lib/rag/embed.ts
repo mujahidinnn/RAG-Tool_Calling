@@ -42,8 +42,19 @@ function getClient(): OpenAI {
 
 export type EmbedResult = { embeddings: number[][]; tokens: number; costUsd: number };
 
-/** Embed banyak teks sekaligus (urutan hasil = urutan input). */
-export async function embedTexts(texts: string[], signal?: AbortSignal): Promise<EmbedResult> {
+/**
+ * Embed banyak teks sekaligus (urutan hasil = urutan input).
+ *
+ * `onBatchUsage(tokens)` dipanggil SETIAP batch yang berhasil — juga kalau
+ * batch lain kemudian gagal. Token batch yang sudah diproses tetap ditagih
+ * OpenAI; kalau hanya dijumlah lalu dikembalikan di akhir, kegagalan di
+ * batch ke-N membuat biaya batch 1..N-1 hilang dari daily cap.
+ */
+export async function embedTexts(
+  texts: string[],
+  signal?: AbortSignal,
+  onBatchUsage?: (tokens: number) => void,
+): Promise<EmbedResult> {
   if (texts.length === 0) return { embeddings: [], tokens: 0, costUsd: 0 };
   if (texts.some((text) => text.trim() === "")) {
     // API menolak string kosong; ini bug di pemanggil, bukan kesalahan user.
@@ -60,10 +71,19 @@ export async function embedTexts(texts: string[], signal?: AbortSignal): Promise
   let tokens = 0;
   for (let i = 0; i < batches.length; i += PARALLEL_BATCHES) {
     const group = batches.slice(i, i + PARALLEL_BATCHES);
-    const results = await Promise.all(group.map((batch) => embedBatch(client, model, batch, signal)));
+    // allSettled (bukan Promise.all yang langsung gagal di error pertama):
+    // batch yang sedang berjalan tetap ditagih, jadi tunggu semuanya dan
+    // laporkan token-nya dulu sebelum error dilempar.
+    const results = await Promise.allSettled(group.map((batch) => embedBatch(client, model, batch, signal)));
     for (const result of results) {
-      embeddings.push(...result.vectors);
-      tokens += result.tokens;
+      if (result.status === "fulfilled") onBatchUsage?.(result.value.tokens);
+    }
+    const failure = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failure) throw failure.reason;
+    for (const result of results) {
+      if (result.status !== "fulfilled") continue;
+      embeddings.push(...result.value.vectors);
+      tokens += result.value.tokens;
     }
   }
   return { embeddings, tokens, costUsd: embeddingCostUsd(model, tokens) };

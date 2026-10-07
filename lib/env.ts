@@ -4,8 +4,9 @@ import "server-only";
 // build GAGAL kalau file ini (atau modul yang mengimpornya) ikut ke bundle
 // client — jadi service role key & API key tidak mungkin bocor ke browser.
 
-import { DEFAULT_DAILY_BUDGET_USD } from "@/lib/config";
-import { EMBEDDING_PRICING } from "@/lib/llm/pricing";
+import { CHAT_MODELS, DEFAULT_DAILY_BUDGET_USD } from "@/lib/config";
+import { EMBEDDING_PRICING, formatUsd } from "@/lib/llm/pricing";
+import { initialChatReserveUsd } from "@/lib/server/budget";
 import type { ProviderName } from "@/lib/llm/types";
 
 export type ServerEnv = {
@@ -20,6 +21,14 @@ export type ServerEnv = {
   /** Opsional: adapter melempar ProviderError "missing_key" saat dipakai. */
   anthropicApiKey: string | null;
   openaiApiKey: string | null;
+  /**
+   * Jumlah reverse proxy tepercaya yang MENAMBAHKAN IP klien ke
+   * X-Forwarded-For (lihat lib/server/client-ip.ts). Default 0 = header IP
+   * tidak dipercaya (kecuali di Vercel).
+   */
+  trustedProxyHops: number;
+  /** true kalau berjalan di Vercel (env VERCEL diisi otomatis oleh platform). */
+  onVercel: boolean;
 };
 
 /** Env server tidak lengkap / tidak valid. Pesannya aman ditampilkan (tanpa nilai secret). */
@@ -87,6 +96,12 @@ export function parseServerEnv(source: EnvSource): ServerEnv {
     problems.push(`DAILY_BUDGET_USD harus angka >= 0, mis. 2 atau 0.01 (sekarang: "${budgetRaw}")`);
   }
 
+  const hopsRaw = read(source, "TRUSTED_PROXY_HOPS");
+  const trustedProxyHops = hopsRaw === null ? 0 : Number(hopsRaw);
+  if (!Number.isInteger(trustedProxyHops) || trustedProxyHops < 0 || trustedProxyHops > 5) {
+    problems.push(`TRUSTED_PROXY_HOPS harus bilangan bulat 0–5 (sekarang: "${hopsRaw}")`);
+  }
+
   if (problems.length > 0) {
     throw new ConfigError(
       `Konfigurasi server belum lengkap — ${problems.join("; ")}. ` +
@@ -104,6 +119,8 @@ export function parseServerEnv(source: EnvSource): ServerEnv {
     dailyBudgetUsd,
     anthropicApiKey: read(source, "ANTHROPIC_API_KEY"),
     openaiApiKey: read(source, "OPENAI_API_KEY"),
+    trustedProxyHops,
+    onVercel: read(source, "VERCEL") !== null,
   };
 }
 
@@ -122,8 +139,29 @@ export function getServerEnv(): ServerEnv {
     if (cached.demoPasscode.length < 12) {
       console.warn("[env] DEMO_PASSCODE kurang dari 12 karakter — mudah ditebak di demo publik.");
     }
+    warnIfBudgetTooSmall(cached.dailyBudgetUsd);
   }
   return cached;
+}
+
+/**
+ * Setiap pertanyaan chat memesan dulu biaya maksimal ronde pertamanya
+ * (lib/server/budget.ts). Budget di bawah angka itu menolak SEMUA pertanyaan
+ * dengan pesan "limit harian" walau pemakaian hari ini $0 — bukan error
+ * (tes "budget kecil" di spec §10 memang memakai ini), tapi perlu diketahui operator.
+ */
+function warnIfBudgetTooSmall(dailyBudgetUsd: number): void {
+  const minimum = Math.max(
+    ...Object.values(CHAT_MODELS).map((model) =>
+      initialChatReserveUsd({ model, question: "", history: [], tools: [] }),
+    ),
+  );
+  if (dailyBudgetUsd < minimum) {
+    console.warn(
+      `[env] DAILY_BUDGET_USD (${formatUsd(dailyBudgetUsd)}) lebih kecil dari reservasi minimal 1 pertanyaan ` +
+        `(±${formatUsd(minimum)}) — semua pertanyaan chat akan ditolak dengan pesan limit harian.`,
+    );
+  }
 }
 
 /** Apakah API key provider chat ini sudah di-set (untuk dropdown UI). */

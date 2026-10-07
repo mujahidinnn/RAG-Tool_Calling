@@ -39,6 +39,8 @@ function abortedError(provider: ProviderName, cause: unknown): ProviderError {
     code: "aborted",
     message: `${DISPLAY_NAME[provider]}: permintaan dibatalkan.`,
     retryable: false,
+    // Token yang sudah dilaporkan sebelum pembatalan tetap ditagih → bawa terus.
+    usage: cause instanceof ProviderError ? cause.usage : undefined,
     cause,
   });
 }

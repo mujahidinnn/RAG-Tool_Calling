@@ -14,6 +14,7 @@ import { getAuthStatus, isApiClientError, logout } from "@/lib/client/api";
 import { DOCUMENT_TTL_HOURS } from "@/lib/config";
 import type { AuthStatusResponse } from "@/lib/types";
 import { useDocuments } from "../hooks/useDocuments";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 import { ChatPanel } from "./ChatPanel";
 import { ChunkPanel, type SourcesView } from "./ChunkPanel";
 import { DocumentList } from "./DocumentList";
@@ -97,17 +98,23 @@ function Workspace({
   onLogout: () => void;
 }) {
   const docs = useDocuments({ onUnauthorized });
+  // Breakpoint `lg` Tailwind (64rem): di atasnya 2 kolom, tanpa tab.
+  const isDesktop = useMediaQuery("(min-width: 64rem)");
   const [tab, setTab] = useState<Tab | null>(null);
   const [sourcesView, setSourcesView] = useState<SourcesView | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Tab awal di HP ditentukan SEKALI saat daftar dokumen pertama kali tiba:
   // belum ada dokumen → "Dokumen" (CTA upload), sudah ada → "Chat".
+  // Sebelum itu TIDAK ada tab terpilih (placeholder netral): default "Dokumen"
+  // membuat user yang sudah punya dokumen melihat tab melompat ke "Chat".
   // (Pola resmi React "menyesuaikan state saat render", tanpa effect tambahan.)
   if (tab === null && docs.documents !== null) {
     setTab(docs.documents.length > 0 ? "chat" : "documents");
+  } else if (tab === null && docs.loadError !== null) {
+    setTab("documents"); // pesan error + tombol "Coba lagi" ada di panel Dokumen
   }
-  const activeTab: Tab = tab ?? "documents";
+  const activeTab = tab;
   const documentCount = docs.documents?.length ?? 0;
 
   const openSources = useCallback((view: SourcesView) => setSourcesView(view), []);
@@ -147,37 +154,51 @@ function Workspace({
       <MobileTabs active={activeTab} onChange={setTab} documentCount={documentCount} />
 
       <div className="flex min-h-0 flex-1">
+        {activeTab === null && (
+          <div className="flex flex-1 items-center justify-center lg:hidden" aria-busy="true">
+            <span role="status" className="sr-only">
+              Memuat dokumen…
+            </span>
+            {/* Muncul pelan setelah jeda: muat cepat = tidak ada kedipan spinner. */}
+            <span className="animate-fade-in" style={{ animationDelay: "400ms" }}>
+              <Spinner className="size-5 text-zinc-400" />
+            </span>
+          </div>
+        )}
+        {/* <aside>/<main> tetap landmark; role tabpanel hanya di HP, di wrapper dalam
+            (di desktop tablist disembunyikan — tabpanel tanpa tab membingungkan screen reader). */}
         <aside
-          id="panel-documents"
-          role="tabpanel"
-          aria-labelledby="tab-documents"
+          aria-label="Dokumen"
           className={cx(
             "min-h-0 w-full flex-col bg-zinc-50/70 lg:flex lg:w-[22rem] lg:shrink-0 lg:border-r lg:border-zinc-200 xl:w-96 dark:bg-zinc-900/30 lg:dark:border-zinc-800",
             activeTab === "documents" ? "flex" : "hidden",
           )}
         >
-          <DocumentList state={docs} fileInputRef={fileInputRef} />
+          <div id="panel-documents" {...tabPanelProps("documents", isDesktop)} className="flex min-h-0 flex-1 flex-col">
+            <DocumentList state={docs} fileInputRef={fileInputRef} />
+          </div>
         </aside>
-        <main
-          id="panel-chat"
-          role="tabpanel"
-          aria-labelledby="tab-chat"
-          className={cx("min-h-0 min-w-0 flex-1 flex-col lg:flex", activeTab === "chat" ? "flex" : "hidden")}
-        >
-          <ChatPanel
-            providers={status.providers}
-            defaultProvider={status.defaultProvider}
-            documents={docs.documents}
-            onUnauthorized={onUnauthorized}
-            onOpenSources={openSources}
-            onRequestUpload={requestUpload}
-          />
+        <main className={cx("min-h-0 min-w-0 flex-1 flex-col lg:flex", activeTab === "chat" ? "flex" : "hidden")}>
+          <div id="panel-chat" {...tabPanelProps("chat", isDesktop)} className="flex min-h-0 flex-1 flex-col">
+            <ChatPanel
+              providers={status.providers}
+              defaultProvider={status.defaultProvider}
+              documents={docs.documents}
+              onUnauthorized={onUnauthorized}
+              onOpenSources={openSources}
+              onRequestUpload={requestUpload}
+            />
+          </div>
         </main>
       </div>
 
       <ChunkPanel view={sourcesView} onClose={closeSources} />
     </div>
   );
+}
+
+function tabPanelProps(id: Tab, isDesktop: boolean) {
+  return isDesktop ? {} : { role: "tabpanel", "aria-labelledby": `tab-${id}` };
 }
 
 const TABS: { id: Tab; label: string; icon: typeof Files }[] = [
@@ -191,14 +212,15 @@ function MobileTabs({
   onChange,
   documentCount,
 }: {
-  active: Tab;
+  /** null = tab awal belum ditentukan (daftar dokumen masih dimuat). */
+  active: Tab | null;
   onChange: (tab: Tab) => void;
   documentCount: number;
 }) {
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
-    const next = active === "documents" ? "chat" : "documents";
+    const next = (active ?? "documents") === "documents" ? "chat" : "documents";
     onChange(next);
     document.getElementById(`tab-${next}`)?.focus();
   };
@@ -220,7 +242,8 @@ function MobileTabs({
             role="tab"
             aria-selected={selected}
             aria-controls={`panel-${id}`}
-            tabIndex={selected ? 0 : -1}
+            // Belum ada tab terpilih → tab pertama tetap bisa dicapai dengan Tab.
+            tabIndex={selected || (active === null && id === "documents") ? 0 : -1}
             onClick={() => onChange(id)}
             className={cx(
               "relative flex h-11 flex-1 items-center justify-center gap-2 text-sm font-medium transition-colors",

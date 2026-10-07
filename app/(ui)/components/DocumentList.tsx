@@ -1,24 +1,31 @@
 "use client";
 
 import { CircleAlert, FileCode, FileText, FileType, RotateCcw, Trash, X } from "lucide-react";
-import { useState, type RefObject } from "react";
+import { useRef, useState, type RefObject } from "react";
 import { fileKind, formatBytes, formatRelativeTime } from "@/lib/client/format";
 import { MAX_FILES_PER_SESSION } from "@/lib/config";
 import type { DocumentDTO } from "@/lib/types";
 import type { DocumentsState, UploadItem } from "../hooks/useDocuments";
 import { useNow } from "../hooks/useNow";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { UploadDropzone } from "./UploadDropzone";
-import { Button, IconButton, Spinner, StatusBadge, cx } from "./ui";
+import { FileInput, UploadDropzone } from "./UploadDropzone";
+import { Button, IconButton, Spinner, StatusBadge, cx, focusIfKeyboardUser } from "./ui";
 
 type Props = {
   state: DocumentsState;
   fileInputRef: RefObject<HTMLInputElement | null>;
 };
 
+/** `reupload` = setelah dihapus, langsung buka file picker (dokumen gagal diproses). */
+type PendingDelete = { doc: DocumentDTO; reupload: boolean };
+
 export function DocumentList({ state, fileInputRef }: Props) {
   const { documents, loadError, uploads } = state;
-  const [pendingDelete, setPendingDelete] = useState<DocumentDTO | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<PendingDelete | null>(null);
+  // Target fokus yang selalu ada, untuk aksi yang menghapus tombol yang sedang
+  // difokus (hapus dokumen, tutup/batal upload, coba muat ulang).
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const focusHeading = () => focusIfKeyboardUser(headingRef.current);
   // Satu "jam" bersama untuk label "5 mnt lalu" di semua baris (bukan 1 timer per baris).
   const now = useNow(30_000);
 
@@ -28,17 +35,25 @@ export function DocumentList({ state, fileInputRef }: Props) {
   const usedSlots = (documents?.length ?? 0) + activeUploads;
   const isFull = usedSlots >= MAX_FILES_PER_SESSION;
 
+  // Dipanggil SETELAH dialog tertutup (lihat ConfirmDialog), masih di dalam
+  // handler klik: syarat browser untuk membuka file picker lewat .click().
   const confirmDelete = () => {
     if (!pendingDelete) return;
-    const id = pendingDelete.id;
+    const { doc, reupload } = pendingDelete;
+    // Tombol hapus di baris ini segera diganti spinner, lalu barisnya hilang.
+    focusHeading();
     setPendingDelete(null);
-    void state.removeDocument(id);
+    void state.removeDocument(doc.id);
+    if (reupload) fileInputRef.current?.click();
   };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      <FileInput inputRef={fileInputRef} onFiles={state.addFiles} />
       <div className="flex items-center justify-between px-4 pt-4 pb-3 sm:px-5">
-        <h2 className="text-sm font-semibold tracking-tight">Dokumen</h2>
+        <h2 ref={headingRef} tabIndex={-1} className="text-sm font-semibold tracking-tight">
+          Dokumen
+        </h2>
         <span
           className="rounded-full bg-zinc-100 px-2 py-0.5 text-[0.6875rem] font-medium text-zinc-600 tabular-nums dark:bg-zinc-800 dark:text-zinc-400"
           title={`Maksimal ${MAX_FILES_PER_SESSION} dokumen per sesi`}
@@ -49,7 +64,13 @@ export function DocumentList({ state, fileInputRef }: Props) {
 
       {!isEmpty && (
         <div className="px-4 sm:px-5">
-          <UploadDropzone variant="compact" disabled={isFull || isLoading} onFiles={state.addFiles} inputRef={fileInputRef} />
+          <UploadDropzone
+            variant="compact"
+            disabled={isFull || isLoading}
+            loading={isLoading}
+            onFiles={state.addFiles}
+            inputRef={fileInputRef}
+          />
         </div>
       )}
 
@@ -57,7 +78,13 @@ export function DocumentList({ state, fileInputRef }: Props) {
         {isLoading ? (
           <DocumentSkeletonList />
         ) : documents === null ? (
-          <LoadError message={loadError ?? "Gagal memuat daftar dokumen."} onRetry={state.retryLoad} />
+          <LoadError
+            message={loadError ?? "Gagal memuat daftar dokumen."}
+            onRetry={() => {
+              focusHeading(); // kartu error diganti skeleton
+              state.retryLoad();
+            }}
+          />
         ) : isEmpty ? (
           <UploadDropzone variant="hero" disabled={false} onFiles={state.addFiles} inputRef={fileInputRef} />
         ) : (
@@ -73,9 +100,15 @@ export function DocumentList({ state, fileInputRef }: Props) {
                 <UploadRow
                   key={item.localId}
                   item={item}
-                  onCancel={() => state.cancelUpload(item.localId)}
+                  onCancel={() => {
+                    focusHeading(); // baris hilang setelah upload dibatalkan
+                    state.cancelUpload(item.localId);
+                  }}
                   onRetry={() => state.retryUpload(item.localId)}
-                  onDismiss={() => state.dismissUpload(item.localId)}
+                  onDismiss={() => {
+                    focusHeading();
+                    state.dismissUpload(item.localId);
+                  }}
                 />
               ))}
               {documents.map((doc) => (
@@ -85,7 +118,8 @@ export function DocumentList({ state, fileInputRef }: Props) {
                   now={now}
                   deleting={state.deletingIds.has(doc.id)}
                   error={state.rowErrors[doc.id]}
-                  onDelete={() => setPendingDelete(doc)}
+                  onDelete={() => setPendingDelete({ doc, reupload: false })}
+                  onDeleteAndReupload={() => setPendingDelete({ doc, reupload: true })}
                 />
               ))}
             </ul>
@@ -95,14 +129,15 @@ export function DocumentList({ state, fileInputRef }: Props) {
 
       <ConfirmDialog
         open={pendingDelete !== null}
-        title="Hapus dokumen?"
+        title={pendingDelete?.reupload ? "Hapus & upload ulang?" : "Hapus dokumen?"}
         description={
           <>
-            <span className="font-medium break-all text-zinc-900 dark:text-zinc-100">{pendingDelete?.filename}</span>{" "}
+            <span className="font-medium break-all text-zinc-900 dark:text-zinc-100">{pendingDelete?.doc.filename}</span>{" "}
             beserta semua potongan (chunk) dan embedding-nya akan dihapus permanen dari storage &amp; database.
+            {pendingDelete?.reupload && " Setelah itu pilih file untuk diupload ulang."}
           </>
         }
-        confirmLabel="Hapus"
+        confirmLabel={pendingDelete?.reupload ? "Hapus & pilih file" : "Hapus"}
         onConfirm={confirmDelete}
         onCancel={() => setPendingDelete(null)}
       />
@@ -142,12 +177,14 @@ function DocumentRow({
   deleting,
   error,
   onDelete,
+  onDeleteAndReupload,
 }: {
   doc: DocumentDTO;
   now: number;
   deleting: boolean;
   error: string | undefined;
   onDelete: () => void;
+  onDeleteAndReupload: () => void;
 }) {
   const meta = [
     formatBytes(doc.sizeBytes),
@@ -204,8 +241,13 @@ function DocumentRow({
         <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-xs leading-5 text-red-800 dark:bg-red-500/10 dark:text-red-200">
           <p>{doc.errorMessage ?? "Dokumen gagal diproses."}</p>
           <p className="mt-1 text-red-700/80 dark:text-red-300/70">
-            Hapus dokumen ini lalu upload ulang (mis. versi PDF yang teksnya bisa diseleksi).
+            Upload ulang file-nya — untuk PDF hasil scan, pakai versi yang teksnya bisa diseleksi.
           </p>
+          {/* Error yang actionable (spec §6): 1 klik, bukan cari ikon hapus + file lagi. */}
+          <Button size="sm" variant="secondary" className="mt-2" onClick={onDeleteAndReupload} disabled={deleting}>
+            <RotateCcw aria-hidden="true" />
+            Hapus &amp; upload ulang
+          </Button>
         </div>
       )}
 
@@ -235,6 +277,7 @@ function UploadRow({
   onRetry: () => void;
   onDismiss: () => void;
 }) {
+  const closeRef = useRef<HTMLButtonElement>(null);
   const percent = Math.round(item.progress * 100);
   const uploading = item.status === "uploading";
   // Semua byte sudah terkirim tapi respons belum datang = server sedang memvalidasi & menyimpan.
@@ -263,6 +306,7 @@ function UploadRow({
           </p>
         </div>
         <IconButton
+          ref={closeRef}
           label={uploading ? `Batalkan upload ${item.file.name}` : `Tutup pesan error ${item.file.name}`}
           icon={X}
           onClick={uploading ? onCancel : onDismiss}
@@ -295,7 +339,16 @@ function UploadRow({
             {item.error?.message ?? "Upload gagal."}
           </p>
           {item.error?.retryable && (
-            <Button size="sm" variant="secondary" className="mt-2" onClick={onRetry}>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              onClick={() => {
+                // Tombol ini diganti progress bar; tombol X di baris yang sama tetap ada.
+                focusIfKeyboardUser(closeRef.current);
+                onRetry();
+              }}
+            >
               <RotateCcw aria-hidden="true" />
               Coba lagi
             </Button>

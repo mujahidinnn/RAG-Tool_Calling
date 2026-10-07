@@ -7,7 +7,7 @@ import {
   toOpenAIMessages,
   toOpenAITools,
 } from "@/lib/llm/translate";
-import type { Message, Tool } from "@/lib/llm/types";
+import type { AssistantReplay, Message, Tool } from "@/lib/llm/types";
 
 const listTool: Tool = {
   name: "list_uploaded_documents",
@@ -149,6 +149,95 @@ describe("toAnthropicMessages", () => {
     const [block] = assistant.content;
     assert.equal(block.type, "tool_use");
     if (block.type === "tool_use") assert.deepEqual(block.input, {});
+  });
+});
+
+describe("toAnthropicMessages — loop tool dengan blok thinking & error", () => {
+  const replayRound = (id: string, signature: string): AssistantReplay => ({
+    provider: "anthropic",
+    blocks: [
+      { type: "thinking", thinking: "", signature },
+      { type: "text", text: "Saya cek dulu." },
+      { type: "tool_use", id, name: "list_uploaded_documents", input: {} },
+    ],
+  });
+
+  it("assistant dengan replay → giliran asli dikirim apa adanya; pesan tool hanya menambah tool_result", () => {
+    const replay = replayRound("toolu_1", "sig-1");
+    const result = toAnthropicMessages([
+      { role: "user", content: "Dokumen apa saja?" },
+      { role: "assistant", content: "Saya cek dulu.", replay },
+      toolMessage("toolu_1", "list_uploaded_documents", {}, '{"total":1}'),
+    ]);
+    assert.deepEqual(result, [
+      { role: "user", content: "Dokumen apa saja?" },
+      { role: "assistant", content: replay.blocks },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: '{"total":1}' }] },
+    ]);
+  });
+
+  it("2 ronde replay berturut-turut TIDAK digabung jadi 1 giliran (blok thinking tetap di gilirannya)", () => {
+    const first = replayRound("toolu_1", "sig-1");
+    const second = replayRound("toolu_2", "sig-2");
+    const result = toAnthropicMessages([
+      { role: "user", content: "Tanya" },
+      { role: "assistant", content: "", replay: first },
+      toolMessage("toolu_1", "list_uploaded_documents", {}, "a"),
+      { role: "assistant", content: "", replay: second },
+      toolMessage("toolu_2", "list_uploaded_documents", {}, "b"),
+    ]);
+    assert.deepEqual(
+      result.map((turn) => turn.role),
+      ["user", "assistant", "user", "assistant", "user"],
+    );
+    assert.deepEqual(result[1].content, first.blocks);
+    assert.deepEqual(result[3].content, second.blocks);
+  });
+
+  it("ronde tool tanpa thinking setelah giliran replay → giliran baru, giliran replay tidak diubah", () => {
+    const first = replayRound("toolu_1", "sig-1");
+    const result = toAnthropicMessages([
+      { role: "user", content: "Tanya" },
+      { role: "assistant", content: "", replay: first },
+      toolMessage("toolu_1", "list_uploaded_documents", {}, "a"),
+      toolMessage("toolu_2", "get_document_summary", { document_id: "x" }, "b"),
+    ]);
+    assert.deepEqual(
+      result.map((turn) => turn.role),
+      ["user", "assistant", "user", "assistant", "user"],
+    );
+    assert.deepEqual(result[1].content, first.blocks);
+    assert.deepEqual(result[3].content, [
+      { type: "tool_use", id: "toolu_2", name: "get_document_summary", input: { document_id: "x" } },
+    ]);
+  });
+
+  it("tool gagal (isError) → tool_result dengan is_error: true", () => {
+    const result = toAnthropicMessages([
+      { role: "user", content: "Ringkas" },
+      { ...toolMessage("toolu_x", "get_document_summary", { document_id: "a" }, '{"error":"masih diproses"}'), isError: true } as Message,
+    ]);
+    assert.deepEqual(result[2], {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "toolu_x", content: '{"error":"masih diproses"}', is_error: true }],
+    });
+  });
+
+  it("OpenAI mengabaikan replay & isError (tidak punya padanannya)", () => {
+    const result = toOpenAIMessages("", [
+      { role: "user", content: "Tanya" },
+      { role: "assistant", content: "Saya cek dulu.", replay: replayRound("call_1", "sig") },
+      { ...toolMessage("call_1", "list_uploaded_documents", {}, "x"), isError: true } as Message,
+    ]);
+    assert.deepEqual(result, [
+      { role: "user", content: "Tanya" },
+      {
+        role: "assistant",
+        content: "Saya cek dulu.",
+        tool_calls: [{ id: "call_1", type: "function", function: { name: "list_uploaded_documents", arguments: "{}" } }],
+      },
+      { role: "tool", tool_call_id: "call_1", content: "x" },
+    ]);
   });
 });
 

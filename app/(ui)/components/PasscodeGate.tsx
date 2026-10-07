@@ -98,7 +98,7 @@ export function PasscodeGate({ onUnlocked, notice }: Props) {
               aria-invalid={error !== null}
               aria-describedby={error ? errorId : undefined}
               className={cx(
-                "h-11 w-full rounded-xl border bg-white pr-11 pl-3.5 text-sm text-zinc-900 shadow-xs transition-[border-color,box-shadow] placeholder:text-zinc-400 focus-visible:outline-none dark:bg-zinc-950 dark:text-zinc-100",
+                "h-11 w-full rounded-xl border bg-white pr-11 pl-3.5 text-sm text-zinc-900 shadow-xs transition-[border-color,box-shadow] placeholder:text-zinc-500 focus-visible:outline-none dark:bg-zinc-950 dark:text-zinc-100 dark:placeholder:text-zinc-400",
                 error
                   ? "border-red-300 focus:ring-4 focus:ring-red-500/10 dark:border-red-500/50"
                   : "border-zinc-300 focus:border-accent-400 focus:ring-4 focus:ring-accent-500/10 dark:border-zinc-700",

@@ -19,7 +19,26 @@ export type TextChunk = {
   tokenCount: number;
 };
 
-export type ChunkOptions = { chunkTokens?: number; overlapTokens?: number };
+export type ChunkOptions = {
+  chunkTokens?: number;
+  overlapTokens?: number;
+  /**
+   * Batas total token dokumen. Lewat batas → DocumentTooLongError, dilempar
+   * SEGERA saat tokenisasi melewatinya (tidak menunggu seluruh teks selesai
+   * di-encode — tokenisasi sinkron 5 MB teks bisa memblokir server belasan detik).
+   */
+  maxTokens?: number;
+};
+
+/** Dokumen melebihi ChunkOptions.maxTokens. */
+export class DocumentTooLongError extends Error {
+  readonly maxTokens: number;
+  constructor(maxTokens: number) {
+    super(`Dokumen melebihi ${maxTokens} token.`);
+    this.name = "DocumentTooLongError";
+    this.maxTokens = maxTokens;
+  }
+}
 
 // --- Tokenizer ---------------------------------------------------------------
 
@@ -97,13 +116,14 @@ function* encodingSegments(text: string): Generator<string> {
   if (segmentStart < text.length) yield text.slice(segmentStart);
 }
 
-function encodeTokens(text: string): number[] {
+function encodeTokens(text: string, maxTokens = Number.POSITIVE_INFINITY): number[] {
   const enc = getEncoder();
   const tokens: number[] = [];
   for (const segment of encodingSegments(text)) {
     // `[], []` = perlakukan "<|endoftext|>" dkk sebagai teks biasa. Default-nya
     // encode() MELEMPAR error → dokumen berisi string itu bikin pipeline gagal.
     for (const token of enc.encode(segment, [], [])) tokens.push(token);
+    if (tokens.length > maxTokens) throw new DocumentTooLongError(maxTokens);
   }
   return tokens;
 }
@@ -219,6 +239,7 @@ function snapToBoundary(enc: Tiktoken, tokens: number[], index: number): number 
  * Batas chunk dimundurkan sedikit (maks beberapa token) ke awal kata, jadi
  * overlap aktual bisa sedikit LEBIH besar dari yang di-set dan chunk sedikit
  * lebih kecil — tidak pernah melebihi `chunkTokens`.
+ * Melempar DocumentTooLongError kalau teks melebihi `maxTokens`.
  */
 export function chunkText(text: string, opts: ChunkOptions = {}): TextChunk[] {
   const size = opts.chunkTokens ?? CHUNK_TOKENS;
@@ -227,7 +248,7 @@ export function chunkText(text: string, opts: ChunkOptions = {}): TextChunk[] {
   if (text.trim() === "") return [];
 
   const enc = getEncoder();
-  const tokens = encodeTokens(text);
+  const tokens = encodeTokens(text, opts.maxTokens);
   const windows = planWindows(tokens.length, size, overlap, (index) =>
     snapToBoundary(enc, tokens, index),
   );

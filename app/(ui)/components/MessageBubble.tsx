@@ -12,9 +12,16 @@ import {
   SquareStop,
   WifiOff,
 } from "lucide-react";
-import { memo, useCallback, useMemo, type ReactNode } from "react";
+import { createContext, memo, useCallback, useContext, useMemo, type ReactNode } from "react";
 import { citationKey, findSource, parseCitations, uniqueCitations, type Citation } from "@/lib/citations";
-import { assistantText, isStreaming, type AssistantTurn, type ChatErrorInfo, type UserTurn } from "@/lib/client/chat";
+import {
+  assistantText,
+  describeChatError,
+  isStreaming,
+  type AssistantTurn,
+  type ChatErrorInfo,
+  type UserTurn,
+} from "@/lib/client/chat";
 import { formatNumber } from "@/lib/client/format";
 import { formatUsd } from "@/lib/llm/pricing";
 import type { ProviderInfo, ProviderName, Source } from "@/lib/types";
@@ -45,6 +52,37 @@ type AssistantProps = {
 };
 
 type ResolvedCitation = { citation: Citation; number: number; source: Source | undefined };
+
+type ResolvedCitations = {
+  byKey: ReadonlyMap<string, ResolvedCitation>;
+  open: (item: ResolvedCitation) => void;
+};
+
+// Hasil pencocokan sitasi berubah tiap token (selama streaming). Disalurkan
+// lewat context supaya `renderCitation` bisa stabil: part teks yang sudah
+// selesai tidak di-parse ulang, badge-nya tetap ter-update.
+const ResolvedCitationsContext = createContext<ResolvedCitations | null>(null);
+
+function InlineCitation({ citation }: { citation: Citation }) {
+  const resolved = useContext(ResolvedCitationsContext);
+  const item = resolved?.byKey.get(citationKey(citation));
+  if (!resolved || !item) return citation.raw;
+  return (
+    <CitationBadge
+      variant="inline"
+      number={item.number}
+      filename={item.citation.filename}
+      chunkIndex={item.citation.chunkIndex}
+      verified={item.source !== undefined}
+      onOpen={() => resolved.open(item)}
+    />
+  );
+}
+
+/** Stabil (level modul) — lihat ResolvedCitationsContext. */
+function renderInlineCitation(citation: Citation): ReactNode {
+  return <InlineCitation citation={citation} />;
+}
 
 function AssistantMessageImpl({ turn, providers, onOpenSources, onRetry }: AssistantProps) {
   const streaming = isStreaming(turn);
@@ -86,21 +124,8 @@ function AssistantMessageImpl({ turn, providers, onOpenSources, onRetry }: Assis
     [onOpenSources, sources, resolved.citedNumbers],
   );
 
-  const renderCitation = useCallback(
-    (citation: Citation): ReactNode => {
-      const item = resolved.byKey.get(citationKey(citation));
-      if (!item) return citation.raw;
-      return (
-        <CitationBadge
-          variant="inline"
-          number={item.number}
-          filename={item.citation.filename}
-          chunkIndex={item.citation.chunkIndex}
-          verified={item.source !== undefined}
-          onOpen={() => openCitation(item)}
-        />
-      );
-    },
+  const citationContext = useMemo<ResolvedCitations>(
+    () => ({ byKey: resolved.byKey, open: openCitation }),
     [resolved.byKey, openCitation],
   );
 
@@ -122,7 +147,7 @@ function AssistantMessageImpl({ turn, providers, onOpenSources, onRetry }: Assis
             <span aria-hidden="true" className={cx("size-1.5 rounded-full", PROVIDER_DOT[turn.provider])} />
             {turn.label}
           </span>
-          {model && <span className="font-mono text-[0.6875rem] text-zinc-400 dark:text-zinc-500">{model}</span>}
+          {model && <span className="font-mono text-[0.6875rem] text-zinc-500 dark:text-zinc-400">{model}</span>}
         </header>
 
         {turn.rewritten && turn.searchQuery && (
@@ -137,19 +162,21 @@ function AssistantMessageImpl({ turn, providers, onOpenSources, onRetry }: Assis
           </p>
         )}
 
-        {turn.parts.map((part, index) =>
-          part.type === "text" ? (
-            <AnswerMarkdown
-              key={`text-${index}`}
-              text={part.text}
-              // Kursor berkedip hanya di part teks TERAKHIR saat masih streaming.
-              streaming={streaming && part === lastPart}
-              renderCitation={renderCitation}
-            />
-          ) : (
-            <ToolResultCard key={`tool-${part.id}`} name={part.name} result={part.result} />
-          ),
-        )}
+        <ResolvedCitationsContext value={citationContext}>
+          {turn.parts.map((part, index) =>
+            part.type === "text" ? (
+              <AnswerMarkdown
+                key={`text-${index}`}
+                text={part.text}
+                // Kursor berkedip hanya di part teks TERAKHIR saat masih streaming.
+                streaming={streaming && part === lastPart}
+                renderCitation={renderInlineCitation}
+              />
+            ) : (
+              <ToolResultCard key={`tool-${part.id}`} name={part.name} result={part.result} />
+            ),
+          )}
+        </ResolvedCitationsContext>
 
         {streaming && !hasVisibleContent && <PendingStatus sources={sources} />}
         {/* Tool sudah selesai, model sedang menyusun lanjutan jawaban. */}
@@ -244,25 +271,6 @@ function PendingStatus({ sources }: { sources: Source[] | null }) {
   );
 }
 
-function errorTitle(error: ChatErrorInfo, providerLabel: string): string {
-  switch (error.code) {
-    case "provider_error":
-      return `${providerLabel} gagal menjawab`;
-    case "rate_limited":
-      return "Terlalu banyak pertanyaan";
-    case "daily_limit":
-      return "Limit harian demo tercapai";
-    case "network":
-      return "Koneksi bermasalah";
-    case "config_error":
-      return "Server belum dikonfigurasi lengkap";
-    case "unauthorized":
-      return "Sesi demo terkunci";
-    default:
-      return "Gagal mendapatkan jawaban";
-  }
-}
-
 function ErrorCard({
   turn,
   error,
@@ -275,17 +283,12 @@ function ErrorCard({
   onRetry: (turn: AssistantTurn, provider: ProviderName) => void;
 }) {
   const secondsLeft = useSecondsUntil(error.retryAt);
-  const failedProvider = error.provider ?? turn.provider;
-  const providerLabel = providers.find((p) => p.name === failedProvider)?.label ?? turn.label;
-  const alternative = providers.find((p) => p.name !== failedProvider);
-  // Budget harian habis = retry pasti ditolak sampai besok → tanpa tombol.
-  const canRetry = error.code !== "daily_limit" && error.code !== "unauthorized";
+  const { title, message, canRetry, alternative } = describeChatError(turn, error, providers);
   const isLimit = error.code === "daily_limit" || error.code === "rate_limited";
   const Icon = error.code === "network" ? WifiOff : isLimit ? Clock : CircleAlert;
 
   return (
     <div
-      role="alert"
       className={cx(
         "rounded-xl border p-3.5",
         isLimit
@@ -302,31 +305,42 @@ function ErrorCard({
           )}
         />
         <div className="min-w-0 flex-1">
-          <p
-            className={cx(
-              "text-sm font-medium",
-              isLimit ? "text-amber-900 dark:text-amber-200" : "text-red-900 dark:text-red-200",
-            )}
-          >
-            {errorTitle(error, providerLabel)}
-          </p>
-          <p
-            className={cx(
-              "mt-0.5 text-sm leading-6 break-words",
-              isLimit ? "text-amber-800/90 dark:text-amber-200/80" : "text-red-800/90 dark:text-red-200/80",
-            )}
-          >
-            {error.message}
-          </p>
-          {canRetry && (
+          {/* role="alert" hanya judul + pesan: hitung mundur di tombol berubah tiap detik
+              dan tidak boleh ikut dibacakan ulang terus oleh screen reader. */}
+          <div role="alert">
+            <p
+              className={cx(
+                "text-sm font-medium",
+                isLimit ? "text-amber-900 dark:text-amber-200" : "text-red-900 dark:text-red-200",
+              )}
+            >
+              {title}
+            </p>
+            <p
+              className={cx(
+                "mt-0.5 text-sm leading-6 break-words",
+                isLimit ? "text-amber-800/90 dark:text-amber-200/80" : "text-red-800/90 dark:text-red-200/80",
+              )}
+            >
+              {message}
+            </p>
+          </div>
+          {(canRetry || alternative) && (
             <div className="mt-3 flex flex-wrap gap-2">
-              <Button size="sm" variant="secondary" onClick={() => onRetry(turn, failedProvider)} disabled={secondsLeft > 0}>
-                <RotateCcw aria-hidden="true" />
-                {secondsLeft > 0 ? `Coba lagi (${secondsLeft} dtk)` : "Coba lagi"}
-              </Button>
+              {canRetry && (
+                // Retry SELALU dengan provider jawaban ini — tidak pernah ganti provider diam-diam.
+                <Button size="sm" variant="secondary" onClick={() => onRetry(turn, turn.provider)} disabled={secondsLeft > 0}>
+                  <RotateCcw aria-hidden="true" />
+                  {secondsLeft > 0 ? `Coba lagi (${secondsLeft} dtk)` : "Coba lagi"}
+                </Button>
+              )}
               {/* Ganti provider = keputusan EKSPLISIT user, bukan fallback diam-diam. */}
-              {error.code === "provider_error" && alternative && (
-                <Button size="sm" variant="ghost" onClick={() => onRetry(turn, alternative.name)}>
+              {alternative && (
+                <Button
+                  size="sm"
+                  variant={canRetry ? "ghost" : "secondary"}
+                  onClick={() => onRetry(turn, alternative.name)}
+                >
                   Tanya pakai {alternative.label}
                 </Button>
               )}

@@ -3,20 +3,20 @@ import "server-only";
 // Sesi demo + gerbang passcode, berbasis 2 cookie httpOnly:
 // * SESSION_COOKIE (UUID acak) — SATU konsep, DUA pemakaian (spec §1):
 //   scoping dokumen per sesi DAN key rate limit per sesi.
-// * AUTH_COOKIE — bukti "sudah memasukkan passcode yang benar".
+// * AUTH_COOKIE — bukti "sesi INI sudah memasukkan passcode yang benar"
+//   (token terikat ke session id, lihat lib/server/auth-token.ts).
 // Ini bukan auth penuh (non-goal spec §7): tidak ada akun/user.
 
 import { cookies } from "next/headers";
-import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AUTH_COOKIE, SESSION_COOKIE, SESSION_COOKIE_MAX_AGE_SEC } from "@/lib/config";
 import { getServerEnv } from "@/lib/env";
+import { authToken } from "@/lib/server/auth-token";
 import { cookieOptions } from "@/lib/server/cookieOptions";
 import { jsonError } from "@/lib/server/http";
 import { isValidUuid } from "@/lib/server/uuid";
 
-export { isValidUuid };
-
-const AUTH_TOKEN_CONTEXT = "ai-docs-assistant:auth:v1";
+export { authToken, isValidUuid };
 
 /**
  * Session id dari cookie; kalau belum ada / tidak valid, buat baru dan set
@@ -38,15 +38,6 @@ export async function getOrCreateSessionId(): Promise<string> {
   return id;
 }
 
-/**
- * Token yang disimpan di AUTH_COOKIE: HMAC dari passcode, bukan passcode-nya
- * (cookie bocor ≠ passcode bocor). Ganti DEMO_PASSCODE = semua cookie lama
- * otomatis tidak berlaku.
- */
-export function authToken(passcode: string): string {
-  return createHmac("sha256", passcode).update(AUTH_TOKEN_CONTEXT).digest("hex");
-}
-
 // Bandingkan hash SHA-256 (panjang selalu 32 byte) dengan timingSafeEqual:
 // perbandingan string biasa (`===`) berhenti di karakter pertama yang beda,
 // sehingga waktu respons bisa membocorkan berapa karakter yang sudah benar.
@@ -62,17 +53,25 @@ export function verifyPasscode(input: string): boolean {
   return safeEqual(input, getServerEnv().demoPasscode);
 }
 
-/** Apakah request ini membawa AUTH_COOKIE yang valid. */
-export async function isAuthenticated(): Promise<boolean> {
+/**
+ * Apakah request ini membawa AUTH_COOKIE yang valid UNTUK sesi ini. Token
+ * terikat ke session id (lib/server/auth-token.ts): cookie auth dari sesi
+ * lain — atau dipakai bersama session id baru — ditolak.
+ */
+export async function isAuthenticated(sessionId: string): Promise<boolean> {
   const store = await cookies();
   const token = store.get(AUTH_COOKIE)?.value;
   if (!token) return false;
-  return safeEqual(token, authToken(getServerEnv().demoPasscode));
+  return safeEqual(token, authToken(getServerEnv().demoPasscode, sessionId));
 }
 
-export async function setAuthCookie(): Promise<void> {
+export async function setAuthCookie(sessionId: string): Promise<void> {
   const store = await cookies();
-  store.set(AUTH_COOKIE, authToken(getServerEnv().demoPasscode), cookieOptions(SESSION_COOKIE_MAX_AGE_SEC));
+  store.set(
+    AUTH_COOKIE,
+    authToken(getServerEnv().demoPasscode, sessionId),
+    cookieOptions(SESSION_COOKIE_MAX_AGE_SEC),
+  );
 }
 
 export async function clearAuthCookie(): Promise<void> {
@@ -89,7 +88,7 @@ export async function requireSession(): Promise<
   { ok: true; sessionId: string } | { ok: false; response: Response }
 > {
   const sessionId = await getOrCreateSessionId();
-  if (!(await isAuthenticated())) {
+  if (!(await isAuthenticated(sessionId))) {
     return {
       ok: false,
       response: jsonError(401, "unauthorized", "Masukkan passcode demo dulu."),

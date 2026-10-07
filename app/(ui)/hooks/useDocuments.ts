@@ -66,9 +66,10 @@ function validateLocally(file: File): string | null {
 }
 
 // Error yang pasti terulang kalau file yang SAMA dikirim lagi → tanpa tombol retry.
-const NON_RETRYABLE_UPLOAD_CODES = new Set(["file_too_large", "unsupported_type", "empty_file"]);
+// daily_limit: budget harian global habis, retry baru berhasil besok.
+const NON_RETRYABLE_UPLOAD_CODES = new Set(["file_too_large", "unsupported_type", "empty_file", "daily_limit"]);
 
-function toUploadError(err: unknown): { message: string; retryable: boolean } {
+export function toUploadError(err: unknown): { message: string; retryable: boolean } {
   if (isApiClientError(err)) {
     return { message: err.message, retryable: !NON_RETRYABLE_UPLOAD_CODES.has(err.code) };
   }

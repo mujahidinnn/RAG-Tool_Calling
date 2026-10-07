@@ -7,19 +7,16 @@ import "server-only";
 
 import { collectStream } from "@/lib/llm";
 import type { ChatProvider } from "@/lib/llm/types";
+import { estimateTokens } from "@/lib/server/usage-estimate";
 import type { ChatHistoryMessage } from "@/lib/types";
 
-import { REWRITE_SYSTEM_PROMPT, buildRewriteInput, cleanRewrittenQuery } from "./prompt";
-
-/** Cukup 2 pesan terakhir: konteks rujukan hampir selalu ada di situ, dan token tetap murah. */
-const REWRITE_HISTORY_MESSAGES = 2;
-/**
- * Query-nya cuma 1 baris, TAPI batas ini juga mencakup token thinking (Claude)
- * / reasoning (GPT) yang tidak terlihat. Batas terlalu kecil (mis. 200) bisa
- * habis di thinking → teks kosong → diam-diam kembali ke pertanyaan mentah.
- * 1024 tetap membatasi biaya kalau model "kebablasan" (maks ±$0,01).
- */
-const REWRITE_MAX_OUTPUT_TOKENS = 1024;
+import {
+  REWRITE_HISTORY_MESSAGES,
+  REWRITE_MAX_OUTPUT_TOKENS,
+  REWRITE_SYSTEM_PROMPT,
+  buildRewriteInput,
+  resolveRewrittenQuery,
+} from "./prompt";
 
 export type RewriteResult = {
   /** Query yang akan di-embed. */
@@ -54,13 +51,12 @@ export async function rewriteQuery(
     }),
   );
 
-  // Output kosong / aneh → pakai pertanyaan asli (retrieval tetap jalan).
-  const cleaned = cleanRewrittenQuery(result.text);
-  const query = cleaned || question.trim();
-  return {
-    query,
-    rewritten: query !== question.trim(),
-    inputTokens: result.inputTokens,
-    outputTokens: result.outputTokens,
-  };
+  // Output kosong / aneh / gema pertanyaan → pakai pertanyaan asli (retrieval tetap jalan).
+  const { query, rewritten } = resolveRewrittenQuery(result.text, question);
+  // Provider tidak melaporkan token (stream terganggu di akhir) ≠ gratis →
+  // catat estimasi (lib/server/usage-estimate.ts).
+  const usage = result.usageReported
+    ? { inputTokens: result.inputTokens, outputTokens: result.outputTokens }
+    : { inputTokens: estimateTokens(REWRITE_SYSTEM_PROMPT + input), outputTokens: estimateTokens(result.text) };
+  return { query, rewritten, ...usage };
 }

@@ -146,10 +146,12 @@
    * Kursor berkedip di akhir teks yang sedang di-stream (spec §6: bukan spinner).
    * Jawaban dirender react-markdown, jadi kursor ditempel lewat ::after pada
    * elemen terakhir — tidak perlu menyisipkan karakter ke teks jawaban.
+   * Blok kode yang belum ditutup (```) juga elemen terakhir: kursor di <code>-nya.
    */
   .streaming-cursor,
   .md-streaming > :last-child:not(ul, ol, pre)::after,
-  .md-streaming > :is(ul, ol):last-child > li:last-child::after {
+  .md-streaming > :is(ul, ol):last-child > li:last-child::after,
+  .md-streaming > pre:last-child > code::after {
     content: "";
     display: inline-block;
     width: 0.5em;
@@ -229,7 +231,8 @@
   /* Kursor tetap terlihat (diam), tidak berkedip. */
   .streaming-cursor,
   .md-streaming > :last-child:not(ul, ol, pre)::after,
-  .md-streaming > :is(ul, ol):last-child > li:last-child::after {
+  .md-streaming > :is(ul, ol):last-child > li:last-child::after,
+  .md-streaming > pre:last-child > code::after {
     animation: none !important;
   }
 }

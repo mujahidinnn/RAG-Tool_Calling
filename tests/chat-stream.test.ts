@@ -9,6 +9,7 @@ import { MAX_TOOL_ROUNDS } from "@/lib/config";
 import { chatCostUsd } from "@/lib/llm/pricing";
 import {
   ProviderError,
+  type AssistantReplay,
   type ChatOptions,
   type ChatProvider,
   type Message,
@@ -16,14 +17,16 @@ import {
   type Tool,
 } from "@/lib/llm/types";
 import { buildSystemPrompt, formatContext } from "@/lib/rag/prompt";
+import { DAILY_LIMIT_MESSAGE } from "@/lib/server/budget";
 import {
   MAX_TOOL_CALLS_PER_ROUND,
+  TRUNCATED_NOTICE,
   createChatStream,
   type ChatStreamDeps,
   type ChatStreamInput,
 } from "@/lib/server/chat-stream";
 import { estimateTokens } from "@/lib/server/usage-estimate";
-import type { ToolContext, ToolExecutionResult } from "@/lib/tools/shared";
+import { toolErrorResult, type ToolContext, type ToolExecutionResult } from "@/lib/tools/shared";
 import type { ChatHistoryMessage, ChatStreamEvent, Source } from "@/lib/types";
 
 // --- Perlengkapan test ---------------------------------------------------------------
@@ -136,10 +139,12 @@ function toolResult(content: string, usage = { inputTokens: 0, outputTokens: 0 }
 function makeDeps(overrides: Partial<ChatStreamDeps> = {}): {
   deps: ChatStreamDeps;
   settleCalls: { tokens: number; costUsd: number }[];
+  reserveCalls: number[];
   toolInvocations: ToolInvocation[];
   settled: Promise<void>;
 } {
   const settleCalls: { tokens: number; costUsd: number }[] = [];
+  const reserveCalls: number[] = [];
   const toolInvocations: ToolInvocation[] = [];
   let markSettled: () => void = () => undefined;
   const settled = new Promise<void>((resolve) => {
@@ -161,13 +166,17 @@ function makeDeps(overrides: Partial<ChatStreamDeps> = {}): {
       return toolResult(JSON.stringify({ total: 1 }));
     },
     tools: TOOLS,
+    reserveMore: async (costUsd) => {
+      reserveCalls.push(costUsd);
+      return true;
+    },
     settleUsage: async (actual) => {
       settleCalls.push(actual);
       markSettled();
     },
     ...overrides,
   };
-  return { deps, settleCalls, toolInvocations, settled };
+  return { deps, settleCalls, reserveCalls, toolInvocations, settled };
 }
 
 function makeInput(provider: ChatProvider, overrides: Partial<ChatStreamInput> = {}): ChatStreamInput {
@@ -428,7 +437,10 @@ describe("createChatStream — loop tool-call (spec §1b)", () => {
   });
 
   it(`berhenti setelah ${MAX_TOOL_ROUNDS} ronde tool: ronde terakhir tetap kirim tools + instruksi menjawab`, async () => {
-    const { provider, calls } = fakeProvider(() => reply(toolCall(`call_${Math.random()}`), done(100, 10)));
+    // Input berbeda tiap ronde: panggilan identik dalam 1 pertanyaan memakai hasil pertama (cache).
+    const { provider, calls } = fakeProvider((index) =>
+      reply(toolCall(`call_${index}`, "list_uploaded_documents", { ronde: index }), done(100, 10)),
+    );
     const { deps, settleCalls, toolInvocations } = makeDeps();
 
     const events = await readAll(createChatStream(makeInput(provider), deps));
@@ -460,7 +472,7 @@ describe("createChatStream — loop tool-call (spec §1b)", () => {
 
   it(`maks ${MAX_TOOL_CALLS_PER_ROUND} tool call dieksekusi per ronde; sisanya tetap dijawab dengan error`, async () => {
     const count = MAX_TOOL_CALLS_PER_ROUND + 2;
-    const calls = Array.from({ length: count }, (_, i) => toolCall(`call_${i}`));
+    const calls = Array.from({ length: count }, (_, i) => toolCall(`call_${i}`, "list_uploaded_documents", { n: i }));
     const { provider, calls: providerCalls } = fakeProvider([
       reply(...calls, done(10, 5)),
       reply(text("ok"), done(10, 5)),
@@ -685,5 +697,226 @@ describe("createChatStream — client memutus koneksi", () => {
     assert.deepEqual(events.map((event) => event.type), ["usage", "done"]);
     assert.equal(settleCalls.length, 1);
     assert.deepEqual(settleCalls[0], { tokens: 0, costUsd: 0 });
+  });
+});
+
+describe("createChatStream — reservasi budget bertahap", () => {
+  it("ronde 0 memakai reservasi awal route; ronde tool berikutnya memesan biaya maksimalnya sendiri", async () => {
+    const { provider } = fakeProvider([
+      reply(toolCall("call_1"), done(500, 20)),
+      reply(text("Selesai."), done(700, 30)),
+    ]);
+    const { deps, reserveCalls, settleCalls } = makeDeps();
+
+    await readAll(createChatStream(makeInput(provider), deps));
+
+    assert.equal(reserveCalls.length, 1, "hanya ronde ke-2 yang memesan tambahan");
+    // Minimal biaya output maksimal 1 ronde.
+    assert.ok(reserveCalls[0] >= chatCostUsd(MODEL, 0, 4096), `reservasi ${reserveCalls[0]} terlalu kecil`);
+    assert.equal(settleCalls.length, 1);
+  });
+
+  it("reservasi tambahan ditolak → ronde berikutnya TIDAK dipanggil, event error daily_limit, settle tetap 1x", async () => {
+    const { provider, calls } = fakeProvider([
+      reply(text("Saya cek dulu."), toolCall("call_1"), done(500, 20)),
+      reply(text("tidak boleh terpanggil"), done(1, 1)),
+    ]);
+    const { deps, settleCalls } = makeDeps({ reserveMore: async () => false });
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    assert.equal(calls.length, 1);
+    assert.deepEqual(only(events, "error"), {
+      type: "error",
+      code: "daily_limit",
+      message: DAILY_LIMIT_MESSAGE,
+      retryable: false,
+    });
+    assert.deepEqual(events.slice(-3).map((event) => event.type), ["error", "usage", "done"]);
+    // Biaya ronde yang sudah terjadi tetap di-settle.
+    assert.equal(settleCalls.length, 1);
+    assert.equal(settleCalls[0].tokens, 500 + 20 + EMBEDDING_TOKENS);
+  });
+
+  it("tool menerima reserveBudget yang meneruskan ke reserveMore", async () => {
+    const { provider } = fakeProvider([
+      reply(toolCall("call_1"), done(10, 5)),
+      reply(text("ok"), done(10, 5)),
+    ]);
+    let toolReserved: boolean | undefined;
+    const { deps, reserveCalls } = makeDeps({
+      executeTool: async (_name, _input, ctx) => {
+        toolReserved = await ctx.reserveBudget?.(0.05);
+        return toolResult("{}");
+      },
+    });
+
+    await readAll(createChatStream(makeInput(provider), deps));
+
+    assert.equal(toolReserved, true);
+    assert.ok(reserveCalls.includes(0.05));
+  });
+});
+
+describe("createChatStream — akurasi biaya saat gagal", () => {
+  it("error yang membawa usage dari provider → angka itu yang dicatat, bukan estimasi", async () => {
+    const refusal = new ProviderError({
+      provider: "anthropic",
+      code: "refusal",
+      message: "Anthropic: Claude menolak menjawab permintaan ini.",
+      usage: { inputTokens: 8000, outputTokens: 4096 },
+    });
+    const { provider } = fakeProvider([replyThenFail(refusal, text("Sebagian"))]);
+    const { deps, settleCalls } = makeDeps();
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    const usage = only(events, "usage");
+    assert.equal(usage.inputTokens, 8000 + EMBEDDING_TOKENS);
+    assert.equal(usage.outputTokens, 4096);
+    assertClose(usage.costUsd, chatCostUsd(MODEL, 8000, 4096) + EMBEDDING_COST);
+    assert.equal(settleCalls[0].tokens, 8000 + 4096 + EMBEDDING_TOKENS);
+  });
+
+  it("ditolak provider dengan HTTP status (mis. 529 sebelum stream) → tidak ditagih, tidak diestimasi", async () => {
+    const overloaded = new ProviderError({
+      provider: "anthropic",
+      code: "overloaded",
+      status: 529,
+      message: "Anthropic: server provider sedang sibuk/bermasalah (529). Coba lagi sebentar lagi.",
+    });
+    const { provider } = fakeProvider([replyThenFail(overloaded)]);
+    const { deps, settleCalls } = makeDeps();
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    const usage = only(events, "usage");
+    assert.equal(usage.inputTokens, EMBEDDING_TOKENS);
+    assert.equal(usage.outputTokens, 0);
+    assert.equal(settleCalls[0].tokens, EMBEDDING_TOKENS);
+  });
+
+  it("stream selesai tanpa event done (usage OpenAI tidak datang) → estimasi, bukan $0", async () => {
+    const { provider } = fakeProvider([reply(text("Jawaban lengkap."))]);
+    const { deps } = makeDeps();
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    const usage = only(events, "usage");
+    assert.ok(usage.inputTokens > EMBEDDING_TOKENS);
+    assert.ok(usage.outputTokens > 0);
+  });
+});
+
+describe("createChatStream — jawaban terpotong", () => {
+  it("done.truncated pada ronde teks → catatan 'jawaban terpotong' ikut dikirim", async () => {
+    const { provider } = fakeProvider([
+      reply(text("Perbandingan dokumen: pertama"), { type: "done", inputTokens: 10, outputTokens: 4096, truncated: true }),
+    ]);
+    const { deps } = makeDeps();
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    const answer = ofType(events, "text").map((event) => event.delta).join("");
+    assert.equal(answer, `Perbandingan dokumen: pertama\n\n${TRUNCATED_NOTICE}`);
+    assert.equal(ofType(events, "error").length, 0);
+  });
+
+  it("jawaban normal tidak diberi catatan", async () => {
+    const { provider } = fakeProvider([reply(text("Lengkap."), done(10, 5))]);
+    const { deps } = makeDeps();
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+    assert.equal(ofType(events, "text").map((event) => event.delta).join(""), "Lengkap.");
+  });
+});
+
+describe("createChatStream — riwayat loop tool", () => {
+  const REPLAY: AssistantReplay = {
+    provider: "anthropic",
+    blocks: [
+      { type: "thinking", thinking: "", signature: "sig-1" },
+      { type: "tool_use", id: "call_1", name: "list_uploaded_documents", input: {} },
+    ],
+  };
+
+  it("giliran dengan replay (blok thinking) disimpan utuh untuk ronde berikutnya, walau tanpa teks", async () => {
+    const { provider, calls } = fakeProvider([
+      reply({ type: "replay", replay: REPLAY }, toolCall("call_1"), done(10, 5)),
+      reply(text("Selesai."), done(10, 5)),
+    ]);
+    const { deps } = makeDeps();
+
+    await readAll(createChatStream(makeInput(provider), deps));
+
+    assert.deepEqual(calls[1].messages[1], { role: "assistant", content: "", replay: REPLAY });
+  });
+
+  it("ronde terakhir (system prompt berubah) TIDAK mengirim balik blok thinking", async () => {
+    const { provider, calls } = fakeProvider((index) =>
+      reply(
+        {
+          type: "replay",
+          replay: {
+            provider: "anthropic",
+            blocks: [
+              { type: "thinking", thinking: "", signature: `sig-${index}` },
+              { type: "tool_use", id: `call_${index}`, name: "list_uploaded_documents", input: { ronde: index } },
+            ],
+          },
+        },
+        toolCall(`call_${index}`, "list_uploaded_documents", { ronde: index }),
+        done(10, 5),
+      ),
+    );
+    const { deps } = makeDeps();
+
+    await readAll(createChatStream(makeInput(provider), deps));
+
+    const finalCall = calls[MAX_TOOL_ROUNDS];
+    assert.ok(finalCall.options?.system, "ronde terakhir memakai system prompt berbeda");
+    assert.ok(
+      finalCall.messages.every((message) => message.role === "tool" || message.replay === undefined),
+      "tidak boleh ada replay di ronde terakhir",
+    );
+    // Ronde sebelumnya tetap mengirim replay.
+    assert.ok(calls[1].messages.some((message) => message.role === "assistant" && message.replay !== undefined));
+  });
+
+  it("hasil tool yang gagal ditandai isError (→ is_error di Anthropic)", async () => {
+    const { provider, calls } = fakeProvider([
+      reply(toolCall("call_1"), done(10, 5)),
+      reply(text("Maaf."), done(10, 5)),
+    ]);
+    const { deps } = makeDeps({ executeTool: async () => toolErrorResult("Dokumen masih diproses.") });
+
+    await readAll(createChatStream(makeInput(provider), deps));
+
+    const toolMessage = calls[1].messages.find((message) => message.role === "tool");
+    assert.ok(toolMessage?.role === "tool");
+    assert.equal(toolMessage.isError, true);
+  });
+
+  it("panggilan tool identik dalam 1 pertanyaan dieksekusi 1x; biayanya tidak dihitung 2x", async () => {
+    const summary = (id: string): StreamEvent => toolCall(id, "get_document_summary", { document_id: "doc-a" });
+    const { provider, calls } = fakeProvider([
+      reply(summary("call_1"), summary("call_2"), done(10, 5)),
+      reply(summary("call_3"), done(10, 5)),
+      reply(text("Ringkasannya sama."), done(10, 5)),
+    ]);
+    const { deps, toolInvocations } = makeDeps({
+      executeTool: async (name, input, ctx) => {
+        toolInvocations.push({ name, input, ctx });
+        return toolResult('{"summary":"..."}', { inputTokens: 1000, outputTokens: 100 });
+      },
+    });
+
+    const events = await readAll(createChatStream(makeInput(provider), deps));
+
+    assert.equal(toolInvocations.length, 1);
+    assert.equal(ofType(events, "tool_result").length, 3, "setiap tool call tetap dijawab");
+    assert.equal(calls[2].messages.filter((message) => message.role === "tool").length, 3);
+    const usage = only(events, "usage");
+    assert.equal(usage.inputTokens, 30 + 1000 + EMBEDDING_TOKENS);
+    assert.equal(usage.outputTokens, 15 + 100);
   });
 });

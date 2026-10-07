@@ -11,16 +11,16 @@
 
 import { after } from "next/server";
 
-import { MAX_OUTPUT_TOKENS } from "@/lib/config";
 import { getProvider, type ChatProvider } from "@/lib/llm";
-import { chatCostUsd } from "@/lib/llm/pricing";
+import { formatUsd } from "@/lib/llm/pricing";
 import { retrieveChunks } from "@/lib/rag/retrieve";
 import { rewriteQuery } from "@/lib/rag/rewrite";
 import { parseChatRequest, trimHistory } from "@/lib/server/chat-request";
 import { createChatStream } from "@/lib/server/chat-stream";
 import { maybeCleanupExpired } from "@/lib/server/cleanup";
-import { errorFromUnknown, jsonError, readJsonBody } from "@/lib/server/http";
-import { chatRateLimiter } from "@/lib/server/rateLimit";
+import { errorFromUnknown, getClientIp, jsonError, readJsonBody } from "@/lib/server/http";
+import { initialChatReserveUsd } from "@/lib/server/budget";
+import { chatIpRateLimiter, chatRateLimiter } from "@/lib/server/rateLimit";
 import { requireSession } from "@/lib/server/session";
 import { SSE_HEADERS } from "@/lib/server/sse";
 import { DAILY_LIMIT_MESSAGE, reserveBudget, settleUsage, type Reservation } from "@/lib/server/usage";
@@ -36,15 +36,6 @@ export const maxDuration = 60;
  * memakai beberapa pesan terakhir, jadi 1 MB sudah sangat longgar.
  */
 const MAX_CHAT_BODY_BYTES = 1_000_000;
-
-/**
- * Jatah biaya yang DIPESAN sebelum memanggil LLM, lalu dikoreksi ke biaya
- * nyata saat stream selesai. Sengaja ~2x perkiraan pertanyaan berat (8k
- * token input + output maksimal): request paralel tidak bisa bersama-sama
- * melewati budget harian hanya karena biaya nyatanya belum diketahui.
- */
-const RESERVE_INPUT_TOKENS = 8_000;
-const RESERVE_MULTIPLIER = 2;
 
 type PreparedChat = {
   sessionId: string;
@@ -62,6 +53,9 @@ export async function POST(request: Request): Promise<Response> {
   // Mulai titik ini reservasi WAJIB di-settle tepat 1x. Tanggung jawab itu
   // dipegang stream: blok `finally` di chat-stream.ts memanggil settleUsage
   // di akhir stream — sukses, error, maupun client memutus koneksi.
+  // Reservasi tambahan (ronde tool berikutnya, ringkasan) dikumpulkan di
+  // array yang sama supaya ikut di-settle sekaligus.
+  const reservations: Reservation[] = [reservation];
   const stream = createChatStream(
     { ...chat, signal: request.signal },
     {
@@ -69,7 +63,19 @@ export async function POST(request: Request): Promise<Response> {
       retrieveChunks,
       executeTool,
       tools: TOOLS,
-      settleUsage: (actual) => settleUsage(reservation, actual),
+      reserveMore: async (costUsd) => {
+        try {
+          const more = await reserveBudget(costUsd);
+          if (!more.ok) return false;
+          reservations.push(more.reservation);
+          return true;
+        } catch (err) {
+          // Fail closed: DB bermasalah = jangan memanggil LLM tanpa reservasi.
+          console.error("[chat] reservasi budget tambahan gagal:", err instanceof Error ? err.message : err);
+          return false;
+        }
+      },
+      settleUsage: (actual) => settleUsage(reservations, actual),
     },
   );
   return new Response(stream, { headers: SSE_HEADERS });
@@ -95,14 +101,19 @@ async function prepareChat(request: Request): Promise<PreparedChat | Response> {
     const { question } = parsed.value;
     const history = trimHistory(parsed.value.history);
 
-    // Key rate limit = session id dari cookie (konsep yang sama dengan scoping dokumen).
+    // Key rate limit = session id dari cookie (konsep yang sama dengan scoping
+    // dokumen), plus per IP kalau IP-nya bisa dipercaya: sesi baru bisa
+    // dibuat siapa pun yang tahu passcode.
+    const ip = getClientIp(request.headers);
     const limit = chatRateLimiter.check(sessionId);
-    if (!limit.allowed) {
+    const ipLimit = limit.allowed && ip !== null ? chatIpRateLimiter.check(`ip:${ip}`) : null;
+    const blocked = !limit.allowed ? limit : ipLimit?.allowed === false ? ipLimit : null;
+    if (blocked) {
       return jsonError(
         429,
         "rate_limited",
-        `Terlalu banyak pertanyaan. Coba lagi dalam ${limit.retryAfterSec} detik.`,
-        { retryable: true, retryAfterSec: limit.retryAfterSec },
+        `Terlalu banyak pertanyaan. Coba lagi dalam ${blocked.retryAfterSec} detik.`,
+        { retryable: true, retryAfterSec: blocked.retryAfterSec },
       );
     }
 
@@ -112,9 +123,23 @@ async function prepareChat(request: Request): Promise<PreparedChat | Response> {
     const provider = getProvider(parsed.value.provider);
 
     // Cek-dan-pesan budget dalam 1 statement SQL atomic (lib/server/usage.ts).
-    const estimate = chatCostUsd(provider.model, RESERVE_INPUT_TOKENS, MAX_OUTPUT_TOKENS) * RESERVE_MULTIPLIER;
+    // Yang dipesan di sini = biaya MAKSIMAL panggilan yang pasti terjadi
+    // (rewrite + ronde LLM pertama, dihitung dari panjang prompt). Panggilan
+    // tambahan (ronde tool, ringkasan) memesan sendiri di tengah stream —
+    // dengan begitu request paralel pun tidak bisa bersama-sama melewati
+    // budget harian (lib/server/budget.ts).
+    const estimate = initialChatReserveUsd({ model: provider.model, question, history, tools: TOOLS });
     const reserved = await reserveBudget(estimate);
-    if (!reserved.ok) return jsonError(429, "daily_limit", DAILY_LIMIT_MESSAGE);
+    if (!reserved.ok) {
+      if (estimate > reserved.budgetUsd) {
+        // Pesan untuk operator, bukan user: dengan budget sekecil ini TIDAK
+        // ada pertanyaan yang bisa lolos, berapa pun pemakaian hari ini.
+        console.warn(
+          `[chat] DAILY_BUDGET_USD (${formatUsd(reserved.budgetUsd)}) lebih kecil dari reservasi 1 pertanyaan (${formatUsd(estimate)}) — semua pertanyaan akan ditolak.`,
+        );
+      }
+      return jsonError(429, "daily_limit", DAILY_LIMIT_MESSAGE);
+    }
 
     return { sessionId, provider, question, history, reservation: reserved.reservation };
   } catch (err) {

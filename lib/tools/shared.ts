@@ -10,6 +10,12 @@ export type ToolContext = {
   /** Provider pilihan user — dipakai juga oleh tool yang memanggil LLM (ringkasan). */
   provider: ChatProvider;
   signal?: AbortSignal;
+  /**
+   * Pesan budget harian SEBELUM tool memanggil LLM (mis. ringkasan), dengan
+   * biaya maksimal panggilan itu. false = budget habis → tool harus berhenti
+   * tanpa memanggil LLM. Tidak ada = tanpa batas (mis. di test).
+   */
+  reserveBudget?: (costUsd: number) => Promise<boolean>;
 };
 
 export type ToolExecutionResult = {

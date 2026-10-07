@@ -3,9 +3,9 @@ import "server-only";
 // Langkah 1 pipeline RAG (spec §3.1): ambil teks dari file.
 // PDF lewat unpdf (build PDF.js untuk server/serverless), md/txt langsung decode.
 
-import { extractText as extractPdfText, getResolvedPDFJS } from "unpdf";
+import { getResolvedPDFJS } from "unpdf";
 
-import type { AllowedMimeType } from "@/lib/config";
+import { MAX_DOCUMENT_TOKENS, MAX_EXTRACTED_CHARS, type AllowedMimeType } from "@/lib/config";
 
 import { normalizeExtractedText } from "./normalize";
 
@@ -25,22 +25,46 @@ const PDF_TIMEOUT_MS = 30_000;
 /** Gambar raksasa (lebar × tinggi) tidak di-decode — kita hanya butuh teks. */
 const MAX_PDF_IMAGE_PIXELS = 16_777_216;
 
+export const DOCUMENT_TOO_LONG_MESSAGE =
+  `Dokumen terlalu panjang untuk demo ini (maks ±${Math.round(MAX_DOCUMENT_TOKENS / 1000)} ribu token ≈ 200 halaman teks). ` +
+  "Potong dokumennya lalu upload ulang.";
+
+export type ExtractedText = {
+  text: string;
+  /** Jumlah halaman PDF (untuk cek "PDF hasil scan"); null untuk .md/.txt. */
+  pageCount: number | null;
+};
+
 /** Ekstrak + normalisasi teks. Melempar ExtractionError dengan pesan siap tampil. */
-export async function extractText(bytes: Uint8Array, mimeType: AllowedMimeType): Promise<string> {
+export async function extractText(bytes: Uint8Array, mimeType: AllowedMimeType): Promise<ExtractedText> {
   if (mimeType === "application/pdf") {
-    let raw: string;
+    let raw: { text: string; pageCount: number };
     try {
       raw = await extractFromPdf(bytes);
     } catch (err) {
       throw toExtractionError(err);
     }
-    return normalizeExtractedText(raw, { pdf: true });
+    return { text: normalizeExtractedText(raw.text, { pdf: true }), pageCount: raw.pageCount };
   }
   // UTF-8 sudah divalidasi saat upload (detectFileType); BOM dibuang otomatis.
-  return normalizeExtractedText(new TextDecoder("utf-8").decode(bytes));
+  const text = new TextDecoder("utf-8").decode(bytes);
+  if (text.length > MAX_EXTRACTED_CHARS) throw new ExtractionError(DOCUMENT_TOO_LONG_MESSAGE);
+  return { text: normalizeExtractedText(text), pageCount: null };
 }
 
-async function extractFromPdf(bytes: Uint8Array): Promise<string> {
+/** Teks 1 halaman, dengan aturan yang sama seperti `extractText` milik unpdf. */
+async function pageText(pdf: PdfDocument, pageNumber: number): Promise<string> {
+  const content = await (await pdf.getPage(pageNumber)).getTextContent();
+  let text = "";
+  for (const item of content.items) {
+    if ("str" in item && typeof item.str === "string") text += item.str + (item.hasEOL ? "\n" : "");
+  }
+  return text;
+}
+
+type PdfDocument = Awaited<ReturnType<Awaited<ReturnType<typeof getResolvedPDFJS>>["getDocument"]>["promise"]>;
+
+async function extractFromPdf(bytes: Uint8Array): Promise<{ text: string; pageCount: number }> {
   // Pakai getDocument langsung (bukan getDocumentProxy) supaya kita memegang
   // loadingTask-nya: kalau timeout terjadi SAAT parsing awal, task tetap bisa
   // dihancurkan alih-alih jalan terus di background.
@@ -60,8 +84,25 @@ async function extractFromPdf(bytes: Uint8Array): Promise<string> {
         `PDF terlalu panjang (${pdf.numPages} halaman). Maksimal ${MAX_PDF_PAGES} halaman.`,
       );
     }
-    const { text } = await deadline.race(extractPdfText(pdf, { mergePages: true }));
-    return text;
+    // Halaman demi halaman (bukan extractText unpdf yang mengambil SEMUA
+    // halaman sekaligus) supaya "bom dekompresi" — PDF kecil berisi jutaan
+    // karakter — berhenti begitu total teks melewati batas.
+    const pages: string[] = [];
+    let totalChars = 0;
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+      const text = await deadline.race(pageText(pdf, pageNumber));
+      totalChars += text.length;
+      if (totalChars > MAX_EXTRACTED_CHARS) throw new ExtractionError(DOCUMENT_TOO_LONG_MESSAGE);
+      pages.push(text);
+    }
+    // Penggabungan sama dengan `mergePages: true` di unpdf: spasi dirapikan,
+    // struktur baris dipertahankan.
+    const merged = pages
+      .join("\n")
+      .replace(/[^\S\n]+/g, " ")
+      .replace(/ ?\n ?/g, "\n")
+      .replace(/\n{3,}/g, "\n\n");
+    return { text: merged, pageCount: pdf.numPages };
   } finally {
     deadline.clear();
     // Bebaskan memori PDF.js (juga menghentikan kerja yang tertunda saat timeout).

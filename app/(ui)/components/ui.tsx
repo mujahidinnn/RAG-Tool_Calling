@@ -12,20 +12,41 @@ export function cx(...classes: Array<string | false | null | undefined>): string
   return classes.filter(Boolean).join(" ");
 }
 
+/**
+ * Pindahkan fokus ke `target` HANYA kalau elemen yang sedang fokus didapat
+ * lewat keyboard (:focus-visible). Dipakai saat tombol yang baru ditekan akan
+ * hilang dari DOM — tanpa ini fokus jatuh ke <body>. Klik mouse/tap sengaja
+ * tidak dipindah: fokus ke textarea di HP memunculkan keyboard layar.
+ */
+export function focusIfKeyboardUser(target: HTMLElement | null): void {
+  const active = document.activeElement;
+  if (!target || !(active instanceof HTMLElement)) return;
+  try {
+    if (active.matches(":focus-visible")) target.focus();
+  } catch {
+    // Browser tanpa dukungan :focus-visible — biarkan perilaku bawaan.
+  }
+}
+
 type ButtonVariant = "primary" | "accent" | "secondary" | "ghost" | "danger";
 type ButtonSize = "sm" | "md";
 
 const BUTTON_BASE =
-  "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg font-medium whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none disabled:opacity-50 [&_svg]:shrink-0";
+  "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg font-medium whitespace-nowrap transition-colors duration-150 disabled:pointer-events-none [&_svg]:shrink-0";
 
+// Gaya disabled per varian (bukan opacity di BUTTON_BASE): primary yang
+// dibuat 50% transparan jadi balok abu-abu berat yang terlihat rusak —
+// pakai abu-abu muda seperti tombol kirim chat.
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   primary:
-    "bg-zinc-900 text-white shadow-sm hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white",
-  accent: "bg-accent-600 text-white shadow-sm hover:bg-accent-500 dark:bg-accent-500 dark:hover:bg-accent-400",
+    "bg-zinc-900 text-white shadow-sm hover:bg-zinc-700 disabled:bg-zinc-200 disabled:text-zinc-400 disabled:shadow-none dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-white dark:disabled:bg-zinc-800 dark:disabled:text-zinc-500",
+  accent:
+    "bg-accent-600 text-white shadow-sm hover:bg-accent-500 disabled:opacity-50 dark:bg-accent-500 dark:hover:bg-accent-400",
   secondary:
-    "border border-zinc-200 bg-white text-zinc-800 shadow-xs hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800",
-  ghost: "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100",
-  danger: "bg-red-600 text-white shadow-sm hover:bg-red-500",
+    "border border-zinc-200 bg-white text-zinc-800 shadow-xs hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800",
+  ghost:
+    "text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 disabled:opacity-50 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-100",
+  danger: "bg-red-600 text-white shadow-sm hover:bg-red-500 disabled:opacity-50",
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {

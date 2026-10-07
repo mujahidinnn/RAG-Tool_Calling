@@ -107,12 +107,24 @@ export function linkifyCitations(text: string): string {
     // Entri dari bracket gabungan berbagi `start` — teks sebelum bracket
     // hanya disalin sekali, lalu link-nya dijejerkan.
     if (citation.start >= cursor) {
-      output += text.slice(cursor, citation.start);
+      output = escapeTrailingBang(output + text.slice(cursor, citation.start));
       cursor = citation.end;
     }
     output += `[${index}](${CITATION_HREF_PREFIX}${index})`;
   });
   return output + text.slice(cursor);
+}
+
+/**
+ * "!" tepat sebelum link mengubahnya jadi sintaks GAMBAR Markdown
+ * (`Penting![0](#cite-0)` → gambar, bukan badge sitasi). Escape "!" itu —
+ * kecuali sudah di-escape (jumlah backslash di depannya ganjil).
+ */
+function escapeTrailingBang(text: string): string {
+  if (!text.endsWith("!")) return text;
+  let backslashes = 0;
+  for (let i = text.length - 2; i >= 0 && text[i] === "\\"; i--) backslashes++;
+  return backslashes % 2 === 0 ? `${text.slice(0, -1)}\\!` : text;
 }
 
 /** Kebalikan dari linkifyCitations: "#cite-3" → 3, selain itu null. */

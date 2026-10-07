@@ -120,6 +120,16 @@ describe("linkifyCitations", () => {
   it("nama file dengan karakter markdown tidak merusak link (href hanya angka)", () => {
     assert.equal(linkifyCitations("[my_(draft)*.md, chunk #2]"), "[0](#cite-0)");
   });
+
+  it('"!" tepat sebelum sitasi di-escape supaya tidak jadi sintaks gambar', () => {
+    assert.equal(linkifyCitations("Penting![a.pdf, chunk #1] lanjut"), "Penting\\![0](#cite-0) lanjut");
+    // Sudah di-escape model → dibiarkan (tidak jadi "\\\\!").
+    assert.equal(linkifyCitations("Penting\\![a.pdf, chunk #1]"), "Penting\\![0](#cite-0)");
+    // Backslash ganda = backslash literal, "!" sesudahnya tetap harus di-escape.
+    assert.equal(linkifyCitations("x\\\\![a.pdf, chunk #1]"), "x\\\\\\![0](#cite-0)");
+    // "!" yang dipisah spasi tidak disentuh.
+    assert.equal(linkifyCitations("Penting! [a.pdf, chunk #1]"), "Penting! [0](#cite-0)");
+  });
 });
 
 describe("citationIndexFromHref", () => {

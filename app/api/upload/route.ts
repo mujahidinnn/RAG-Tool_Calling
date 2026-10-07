@@ -7,11 +7,12 @@
 import { after } from "next/server";
 import { z } from "zod";
 
-import { MAX_FILE_BYTES, MAX_FILES_PER_SESSION, STORAGE_BUCKET } from "@/lib/config";
+import { MAX_FILE_BYTES, MAX_FILES_PER_SESSION, MAX_TOTAL_DOCUMENTS, STORAGE_BUCKET } from "@/lib/config";
 import { processDocument } from "@/lib/rag/process";
 import { maybeCleanupExpired } from "@/lib/server/cleanup";
 import { documentRowSchema, toDocumentDTO } from "@/lib/server/documents";
-import { errorFromUnknown, jsonError } from "@/lib/server/http";
+import { errorFromUnknown, getClientIp, jsonError } from "@/lib/server/http";
+import { uploadIpRateLimiter } from "@/lib/server/rateLimit";
 import { requireSession } from "@/lib/server/session";
 import {
   UNSUPPORTED_TYPE_MESSAGE,
@@ -30,6 +31,8 @@ export const maxDuration = 60;
 
 const FILE_TOO_LARGE_MESSAGE = "File melebihi 5 MB.";
 const TOO_MANY_FILES_MESSAGE = `Maksimal ${MAX_FILES_PER_SESSION} file per sesi. Hapus salah satu dokumen dulu.`;
+const SERVER_FULL_MESSAGE =
+  "Server demo sedang penuh (terlalu banyak dokumen tersimpan). Coba lagi nanti — dokumen lama terhapus otomatis setelah 24 jam.";
 
 const filenameRowsSchema = z.array(z.object({ filename: z.string() }));
 // Fungsi SQL yang `returns documents` dikirim PostgREST sebagai 1 objek;
@@ -48,13 +51,28 @@ export async function POST(request: Request): Promise<Response> {
     const { sessionId } = auth;
     after(() => maybeCleanupExpired());
 
+    // Batas 5 file berlaku per sesi, dan sesi baru bisa dibuat siapa pun yang
+    // tahu passcode → rem tambahan per IP (hanya kalau IP-nya bisa dipercaya).
+    const ip = getClientIp(request.headers);
+    if (ip !== null) {
+      const limit = uploadIpRateLimiter.check(`ip:${ip}`);
+      if (!limit.allowed) {
+        return jsonError(
+          429,
+          "rate_limited",
+          `Terlalu banyak upload dari jaringan ini. Coba lagi dalam ${limit.retryAfterSec} detik.`,
+          { retryable: true, retryAfterSec: limit.retryAfterSec },
+        );
+      }
+    }
+
     if (await isBudgetExhausted()) {
       return jsonError(429, "daily_limit", DAILY_LIMIT_MESSAGE);
     }
 
     const supabase = getSupabase();
     // Cek cepat sebelum membaca body. Pengaman sebenarnya (atomic, anti
-    // upload paralel) ada di RPC create_document di bawah.
+    // upload paralel — termasuk nama file kembar) ada di RPC create_document.
     const { data: existingData, error: existingError } = await supabase
       .from("documents")
       .select("filename")
@@ -103,7 +121,12 @@ export async function POST(request: Request): Promise<Response> {
     const { error: uploadError } = await supabase.storage
       .from(STORAGE_BUCKET)
       .upload(storagePath, read.bytes, { contentType: fileType.mimeType, upsert: false });
-    if (uploadError) throw new Error(`upload ke Storage gagal: ${uploadError.message}`);
+    if (uploadError) {
+      // Belum ada baris yang dibuat → aman dicoba lagi. Pesan spesifik supaya
+      // user tahu file-nya BELUM tersimpan (bukan "error server" umum).
+      console.error(`[upload] upload ke Storage gagal (${storagePath}):`, uploadError.message);
+      return jsonError(502, "internal", "Gagal menyimpan file ke storage. Coba upload lagi.", { retryable: true });
+    }
 
     const { data: created, error: createError } = await supabase.rpc("create_document", {
       p_id: id,
@@ -113,11 +136,16 @@ export async function POST(request: Request): Promise<Response> {
       p_mime_type: fileType.mimeType,
       p_size_bytes: read.bytes.byteLength,
       p_max_docs: MAX_FILES_PER_SESSION,
+      p_max_total_docs: MAX_TOTAL_DOCUMENTS,
     });
     if (createError) {
       // Baris gagal dibuat → hapus file-nya supaya tidak ada file yatim di Storage.
       const { error: removeError } = await supabase.storage.from(STORAGE_BUCKET).remove([storagePath]);
       if (removeError) console.error(`[upload] gagal menghapus file yatim ${storagePath}:`, removeError.message);
+      // Cek global DULU: "global_document_limit_reached" juga memuat "document_limit_reached".
+      if (createError.message.includes("global_document_limit_reached")) {
+        return jsonError(409, "too_many_files", SERVER_FULL_MESSAGE, { retryable: true });
+      }
       if (createError.message.includes("document_limit_reached")) {
         return jsonError(409, "too_many_files", TOO_MANY_FILES_MESSAGE);
       }

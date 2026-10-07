@@ -6,11 +6,12 @@
 //
 // PURE: tanpa React/DOM — dites di tests/chat-state.test.ts.
 
-import { MAX_HISTORY_MESSAGE_CHARS, MAX_HISTORY_MESSAGES } from "@/lib/config";
+import { CHAT_RATE_LIMIT, MAX_HISTORY_MESSAGE_CHARS, MAX_HISTORY_MESSAGES } from "@/lib/config";
 import type {
   ApiErrorCode,
   ChatHistoryMessage,
   ChatStreamEvent,
+  ProviderInfo,
   ProviderName,
   Source,
   ToolCardPayload,
@@ -201,6 +202,86 @@ export function assistantText(turn: AssistantTurn): string {
 
 export function isStreaming(turn: AssistantTurn): boolean {
   return turn.status === "pending" || turn.status === "streaming";
+}
+
+// --- Kartu error ------------------------------------------------------------------------
+
+/**
+ * Apakah jawaban gagal di tahap EMBEDDING query (selalu OpenAI, apa pun
+ * provider chat yang dipilih)?
+ *
+ * Urutan event server: meta → retrieval (embedding + DB) → sources. Satu-
+ * satunya sumber provider_error di antara meta & sources adalah embedding,
+ * jadi error yang datang SETELAH meta (model terisi) tapi SEBELUM sources
+ * pasti dari embedding — juga saat GPT yang dipilih (provider error = provider
+ * jawaban). Provider error ≠ provider jawaban juga hanya terjadi di embedding.
+ */
+export function isEmbeddingFailure(turn: AssistantTurn): boolean {
+  const error = turn.error;
+  if (!error || error.code !== "provider_error") return false;
+  if (error.provider !== undefined && error.provider !== turn.provider) return true;
+  return turn.model !== null && turn.sources === null;
+}
+
+export type ErrorCardModel = {
+  title: string;
+  message: string;
+  /** Tombol "Coba lagi" — selalu dengan provider jawaban ini, TIDAK pernah ganti provider. */
+  canRetry: boolean;
+  /** Tawaran EKSPLISIT bertanya ke provider lain; null = tidak akan menolong. */
+  alternative: ProviderInfo | null;
+};
+
+/** Isi & tombol kartu error di bawah jawaban yang gagal (dipakai MessageBubble). */
+export function describeChatError(
+  turn: AssistantTurn,
+  error: ChatErrorInfo,
+  providers: readonly ProviderInfo[],
+): ErrorCardModel {
+  const embedding = isEmbeddingFailure({ ...turn, error });
+  const providerLabel = providers.find((p) => p.name === turn.provider)?.label ?? turn.label;
+
+  // retryable=false (API key kosong/salah, refusal, config) → retry pasti
+  // gagal lagi. Budget harian habis / sesi terkunci juga tidak bisa di-retry.
+  const canRetry = error.retryable && error.code !== "daily_limit" && error.code !== "unauthorized";
+
+  // Ganti provider chat hanya masuk akal kalau provider chat itu sendiri yang
+  // gagal: embedding selalu OpenAI, jadi gagal sama di provider mana pun.
+  const alternative =
+    error.code === "provider_error" && !embedding
+      ? (providers.find((p) => p.name !== turn.provider && p.configured) ?? null)
+      : null;
+
+  return {
+    title: errorTitle(error, providerLabel, embedding),
+    // Pesan server rate limit memuat "dalam N detik" yang membeku; hitung
+    // mundur yang hidup sudah ada di tombol, jadi pakai teks statis.
+    message:
+      error.code === "rate_limited"
+        ? `Demo ini membatasi ${CHAT_RATE_LIMIT.max} pertanyaan per menit per sesi. Tunggu sebentar, lalu coba lagi.`
+        : error.message,
+    canRetry,
+    alternative,
+  };
+}
+
+function errorTitle(error: ChatErrorInfo, providerLabel: string, embedding: boolean): string {
+  switch (error.code) {
+    case "provider_error":
+      return embedding ? "Embedding (OpenAI) gagal" : `${providerLabel} gagal menjawab`;
+    case "rate_limited":
+      return "Terlalu banyak pertanyaan";
+    case "daily_limit":
+      return "Limit harian demo tercapai";
+    case "network":
+      return "Koneksi bermasalah";
+    case "config_error":
+      return "Server belum dikonfigurasi lengkap";
+    case "unauthorized":
+      return "Sesi demo terkunci";
+    default:
+      return "Gagal mendapatkan jawaban";
+  }
 }
 
 function truncate(text: string, maxChars: number): string {

@@ -1,7 +1,7 @@
 "use client";
 
 import { ExternalLink, ImageOff } from "lucide-react";
-import { memo, useMemo, type ReactNode } from "react";
+import { createContext, memo, useContext, useMemo, type ComponentProps, type ReactNode } from "react";
 import Markdown, { type Components } from "react-markdown";
 import { citationIndexFromHref, linkifyCitations, parseCitations, type Citation } from "@/lib/citations";
 import { cx } from "./ui";
@@ -14,6 +14,45 @@ type Props = {
   renderCitation?: (citation: Citation) => ReactNode;
   className?: string;
 };
+
+type CitationContextValue = {
+  citations: Citation[];
+  renderCitation?: (citation: Citation) => ReactNode;
+};
+
+const CitationContext = createContext<CitationContextValue>({ citations: [] });
+
+/** Link di jawaban: badge sitasi (`#cite-i` dari linkifyCitations) atau link web. */
+function MarkdownLink({ href, children }: ComponentProps<"a">) {
+  const { citations, renderCitation } = useContext(CitationContext);
+  const index = citationIndexFromHref(href);
+  const citation = index === null ? undefined : citations[index];
+  if (citation && renderCitation) return <>{renderCitation(citation)}</>;
+  // Hanya link web absolut yang boleh diklik. URL yang dikosongkan
+  // urlTransform (mis. `javascript:`) atau link relatif cukup jadi teks.
+  if (!href || !/^(https?:|mailto:)/i.test(href)) return <span>{children}</span>;
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer nofollow" title={href}>
+      {children}
+      <ExternalLink aria-hidden="true" className="ml-0.5 inline size-3 -translate-y-px" />
+    </a>
+  );
+}
+
+function BlockedImage({ alt }: ComponentProps<"img">) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+      <ImageOff aria-hidden="true" className="size-3" />
+      gambar tidak dimuat{alt ? `: ${alt}` : ""}
+    </span>
+  );
+}
+
+// Identitas komponen HARUS stabil (level modul): react-markdown memakainya
+// sebagai tipe elemen, jadi fungsi baru tiap token = React me-remount semua
+// link & badge sitasi (fokus keyboard hilang, klik di tengah stream gagal,
+// screen reader membaca ulang). Data yang berubah per token lewat context.
+const MARKDOWN_COMPONENTS: Components = { a: MarkdownLink, img: BlockedImage };
 
 /**
  * Render jawaban LLM sebagai Markdown — dengan aman.
@@ -31,39 +70,17 @@ type Props = {
 function AnswerMarkdownImpl({ text, streaming = false, renderCitation, className }: Props) {
   const citations = useMemo(() => (renderCitation ? parseCitations(text) : []), [text, renderCitation]);
   const markdown = useMemo(() => (renderCitation ? linkifyCitations(text) : text), [text, renderCitation]);
-
-  const components = useMemo<Components>(
-    () => ({
-      a: ({ href, children }) => {
-        const index = citationIndexFromHref(href);
-        const citation = index === null ? undefined : citations[index];
-        if (citation && renderCitation) return <>{renderCitation(citation)}</>;
-        // Hanya link web absolut yang boleh diklik. URL yang dikosongkan
-        // urlTransform (mis. `javascript:`) atau link relatif cukup jadi teks.
-        if (!href || !/^(https?:|mailto:)/i.test(href)) return <span>{children}</span>;
-        return (
-          <a href={href} target="_blank" rel="noopener noreferrer nofollow" title={href}>
-            {children}
-            <ExternalLink aria-hidden="true" className="ml-0.5 inline size-3 -translate-y-px" />
-          </a>
-        );
-      },
-      img: ({ alt }) => (
-        <span className="inline-flex items-center gap-1 rounded bg-zinc-100 px-1.5 py-0.5 text-xs text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-          <ImageOff aria-hidden="true" className="size-3" />
-          gambar tidak dimuat{alt ? `: ${alt}` : ""}
-        </span>
-      ),
-    }),
-    [citations, renderCitation],
-  );
+  const citationContext = useMemo(() => ({ citations, renderCitation }), [citations, renderCitation]);
 
   return (
     <div className={cx("md-answer", streaming && "md-streaming", className)}>
-      <Markdown components={components}>{markdown}</Markdown>
+      <CitationContext value={citationContext}>
+        <Markdown components={MARKDOWN_COMPONENTS}>{markdown}</Markdown>
+      </CitationContext>
     </div>
   );
 }
 
-// memo: saat token baru masuk, hanya bagian teks yang berubah yang di-parse ulang.
+// memo: saat token baru masuk, hanya part teks yang berubah yang di-parse ulang
+// (syaratnya `renderCitation` stabil — lihat MessageBubble).
 export const AnswerMarkdown = memo(AnswerMarkdownImpl);

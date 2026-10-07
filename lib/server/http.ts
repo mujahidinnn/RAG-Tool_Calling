@@ -3,9 +3,11 @@ import "server-only";
 // Helper respons HTTP untuk API route: semua error dikirim dengan bentuk JSON
 // yang sama (ApiErrorBody) supaya UI cukup punya 1 cara menampilkan error.
 
-import { ConfigError } from "@/lib/env";
+import { ConfigError, getServerEnv } from "@/lib/env";
 import { ProviderError, type ProviderName } from "@/lib/llm/types";
 import type { ApiErrorBody, ApiErrorCode } from "@/lib/types";
+
+import { clientIpFromHeaders } from "./client-ip";
 
 export type JsonErrorExtra = {
   retryable?: boolean;
@@ -126,14 +128,12 @@ export async function readJsonBody(
 }
 
 /**
- * IP klien dari header proxy (best effort). Hanya bisa dipercaya kalau app
- * berada di belakang proxy yang MENIMPA header ini (mis. Vercel); kalau
- * self-host tanpa proxy, klien bisa memalsukannya — jadi pakai hanya untuk
- * rem tambahan, bukan satu-satunya kontrol keamanan.
+ * IP klien yang bisa dipercaya untuk rate limit, atau null. Header IP hanya
+ * dipercaya di Vercel atau kalau TRUSTED_PROXY_HOPS di-set (detail & alasan:
+ * lib/server/client-ip.ts). null = limiter per-IP dilewati; limiter per sesi
+ * dan limiter global tetap berlaku.
  */
 export function getClientIp(headers: Headers): string | null {
-  const forwarded = headers.get("x-forwarded-for")?.split(",")[0]?.trim();
-  if (forwarded) return forwarded;
-  const realIp = headers.get("x-real-ip")?.trim();
-  return realIp ? realIp : null;
+  const env = getServerEnv();
+  return clientIpFromHeaders(headers, { trustedProxyHops: env.trustedProxyHops, onVercel: env.onVercel });
 }

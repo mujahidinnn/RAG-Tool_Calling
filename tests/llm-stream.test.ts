@@ -169,7 +169,7 @@ describe("mapAnthropicStream", () => {
     ]);
   });
 
-  it("thinking diabaikan; teks lalu tool call → teks di-stream, tool_call setelahnya, lalu done", async () => {
+  it("thinking tidak di-stream; teks lalu tool call → teks, replay (giliran utuh), tool_call, lalu done", async () => {
     const events = await collectEvents(
       mapAnthropicStream(
         fromArray([
@@ -195,6 +195,19 @@ describe("mapAnthropicStream", () => {
     assert.deepEqual(events, [
       { type: "text", delta: "Saya ringkas dokumennya dulu." },
       {
+        // Giliran asli (thinking + tanda tangan, teks, tool_use) untuk dikirim
+        // balik apa adanya di ronde berikutnya — urutan blok dipertahankan.
+        type: "replay",
+        replay: {
+          provider: "anthropic",
+          blocks: [
+            { type: "thinking", thinking: "", signature: "sig==" },
+            { type: "text", text: "Saya ringkas dokumennya dulu." },
+            { type: "tool_use", id: "toolu_01ABC", name: "get_document_summary", input: { document_id: "3f6c-uuid" } },
+          ],
+        },
+      },
+      {
         type: "tool_call",
         id: "toolu_01ABC",
         name: "get_document_summary",
@@ -202,6 +215,44 @@ describe("mapAnthropicStream", () => {
       },
       { type: "done", inputTokens: 900, outputTokens: 77 },
     ]);
+  });
+
+  it("thinking tanpa tool call → tidak ada replay (tidak ada ronde berikutnya)", async () => {
+    const events = await collectEvents(
+      mapAnthropicStream(
+        fromArray([
+          ant.messageStart(100),
+          ant.thinkingStart(0),
+          ant.thinking(0, "pikir"),
+          ant.signature(0),
+          ant.stop(0),
+          ant.textStart(1),
+          ant.text(1, "Jawaban."),
+          ant.stop(1),
+          ant.messageDelta("end_turn", 20),
+          ant.messageStop(),
+        ]),
+      ),
+    );
+    assert.deepEqual(events, [
+      { type: "text", delta: "Jawaban." },
+      { type: "done", inputTokens: 100, outputTokens: 20 },
+    ]);
+  });
+
+  it("tool call tanpa blok thinking → tidak perlu replay (rekonstruksi biasa setara)", async () => {
+    const events = await collectEvents(
+      mapAnthropicStream(
+        fromArray([
+          ant.messageStart(100),
+          ant.toolStart(0, "toolu_list", "list_uploaded_documents"),
+          ant.stop(0),
+          ant.messageDelta("tool_use", 20),
+          ant.messageStop(),
+        ]),
+      ),
+    );
+    assert.equal(events.filter((event) => event.type === "replay").length, 0);
   });
 
   it("parallel tool calls: semua dikirim berurutan sesuai blok; input kosong → {}", async () => {
@@ -272,6 +323,8 @@ describe("mapAnthropicStream", () => {
     );
     assert.deepEqual(events, [{ type: "text", delta: "Berikut cara" }]);
     assertProviderError(error, { provider: "anthropic", code: "refusal", message: /kategori: cyber/ });
+    // Token yang tetap ditagih ikut dibawa error (bukan diestimasi dari teks yang terlihat).
+    assert.deepEqual((error as ProviderError).usage, { inputTokens: 300, outputTokens: 5 });
   });
 
   it("refusal memotong tool_use → tool TIDAK dikirim", async () => {
@@ -306,9 +359,10 @@ describe("mapAnthropicStream", () => {
     );
     assert.equal(events.filter((e) => e.type === "tool_call").length, 0);
     assertProviderError(error, { provider: "anthropic", code: "unknown", message: /terpotong/ });
+    assert.deepEqual((error as ProviderError).usage, { inputTokens: 300, outputTokens: 4096 });
   });
 
-  it("max_tokens pada jawaban teks biasa → tetap selesai normal (teks terpotong)", async () => {
+  it("max_tokens pada jawaban teks biasa → selesai, done ditandai truncated", async () => {
     const events = await collectEvents(
       mapAnthropicStream(
         fromArray([
@@ -321,7 +375,23 @@ describe("mapAnthropicStream", () => {
         ]),
       ),
     );
-    assert.deepEqual(events.at(-1), { type: "done", inputTokens: 300, outputTokens: 4096 });
+    assert.deepEqual(events.at(-1), { type: "done", inputTokens: 300, outputTokens: 4096, truncated: true });
+  });
+
+  it("model_context_window_exceeded juga dianggap terpotong", async () => {
+    const events = await collectEvents(
+      mapAnthropicStream(
+        fromArray([
+          ant.messageStart(300),
+          ant.textStart(0),
+          ant.text(0, "Jawaban"),
+          ant.stop(0),
+          ant.messageDelta("model_context_window_exceeded", 10),
+          ant.messageStop(),
+        ]),
+      ),
+    );
+    assert.deepEqual(events.at(-1), { type: "done", inputTokens: 300, outputTokens: 10, truncated: true });
   });
 
   it("JSON input tool rusak → input berupa penanda INVALID_JSON (tool akan menolaknya)", async () => {
@@ -468,11 +538,26 @@ describe("mapOpenAIStream", () => {
     ]);
   });
 
-  it("usage tidak datang (stream terganggu setelah finish) → done tetap dikirim dengan 0", async () => {
+  it("usage tidak datang (stream terganggu setelah finish) → TANPA done, supaya pemakai mengestimasi (bukan $0)", async () => {
     const events = await collectEvents(
       mapOpenAIStream(fromArray([oai.chunk({ content: "ok" }), oai.finish("stop")])),
     );
-    assert.deepEqual(events.at(-1), { type: "done", inputTokens: 0, outputTokens: 0 });
+    assert.deepEqual(events, [{ type: "text", delta: "ok" }]);
+  });
+
+  it("finish_reason length pada jawaban teks → done ditandai truncated", async () => {
+    const events = await collectEvents(
+      mapOpenAIStream(fromArray([oai.chunk({ content: "Panjang" }), oai.finish("length"), oai.usage(100, 4096)])),
+    );
+    assert.deepEqual(events.at(-1), { type: "done", inputTokens: 100, outputTokens: 4096, truncated: true });
+  });
+
+  it("content_filter setelah chunk usage → error membawa usage-nya", async () => {
+    const { error } = await collectUntilError(
+      mapOpenAIStream(fromArray([oai.chunk({ content: "x" }), oai.finish("content_filter"), oai.usage(500, 60)])),
+    );
+    assertProviderError(error, { provider: "openai", code: "refusal" });
+    assert.deepEqual((error as ProviderError).usage, { inputTokens: 500, outputTokens: 60 });
   });
 
   it("refusal → teksnya TIDAK di-stream sebagai jawaban, jadi ProviderError refusal", async () => {
@@ -579,7 +664,17 @@ describe("collectStream", () => {
       toolCalls: [{ id: "t1", name: "list_uploaded_documents", input: {} }],
       inputTokens: 100,
       outputTokens: 20,
+      usageReported: true,
     });
+  });
+
+  it("tanpa event done → usageReported false (0 token ≠ gratis); onEvent melihat setiap event", async () => {
+    const seen: string[] = [];
+    const result = await collectStream(fromArray<StreamEvent>([{ type: "text", delta: "a" }]), (event) =>
+      seen.push(event.type),
+    );
+    assert.equal(result.usageReported, false);
+    assert.deepEqual(seen, ["text"]);
   });
 
   it("error dari provider diteruskan apa adanya", async () => {

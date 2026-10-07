@@ -62,7 +62,15 @@ export function ConfirmDialog({ open, title, description, confirmLabel, onConfir
           <Button variant="secondary" onClick={onCancel} autoFocus>
             Batal
           </Button>
-          <Button variant="danger" onClick={onConfirm}>
+          <Button
+            variant="danger"
+            onClick={() => {
+              // Tutup DULU (sinkron) baru onConfirm: halaman sudah tidak inert,
+              // jadi onConfirm boleh memindah fokus atau membuka file picker.
+              ref.current?.close();
+              onConfirm();
+            }}
+          >
             {confirmLabel}
           </Button>
         </div>

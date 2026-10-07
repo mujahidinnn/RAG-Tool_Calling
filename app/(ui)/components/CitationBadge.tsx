@@ -71,7 +71,7 @@ export function CitationBadge({ number, filename, chunkIndex, verified, variant,
         {number}
       </span>
       <span className="min-w-0 truncate">{filename}</span>
-      <span className="shrink-0 font-mono text-[0.6875rem] text-zinc-400 dark:text-zinc-500">#{chunkIndex}</span>
+      <span className="shrink-0 font-mono text-[0.6875rem] text-zinc-500 dark:text-zinc-400">#{chunkIndex}</span>
       {!verified && (
         <span className="inline-flex shrink-0 items-center gap-1 text-[0.6875rem] text-amber-700 dark:text-amber-400">
           <TriangleAlert aria-hidden="true" className="size-3" />

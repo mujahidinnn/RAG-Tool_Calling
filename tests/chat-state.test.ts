@@ -6,12 +6,16 @@ import {
   buildHistory,
   chatReducer,
   createAssistantTurn,
+  describeChatError,
+  failTurn,
   finishTurn,
+  isEmbeddingFailure,
   type AssistantTurn,
+  type ChatErrorInfo,
   type ChatTurn,
 } from "@/lib/client/chat";
-import { MAX_HISTORY_MESSAGE_CHARS, MAX_HISTORY_MESSAGES } from "@/lib/config";
-import type { ChatStreamEvent } from "@/lib/types";
+import { CHAT_RATE_LIMIT, MAX_HISTORY_MESSAGE_CHARS, MAX_HISTORY_MESSAGES } from "@/lib/config";
+import type { ChatStreamEvent, ProviderInfo, ProviderName } from "@/lib/types";
 
 function newTurn(id = "a1", replyTo = "u1"): AssistantTurn {
   return createAssistantTurn({ id, replyTo, question: "Apa isi dokumen?", provider: "anthropic", label: "Claude" });
@@ -161,5 +165,105 @@ describe("chatReducer", () => {
     turns = chatReducer(turns, { type: "event", id: "a2", event: { type: "text", delta: "Hai" } });
     assert.equal(assistantText(turns[1] as AssistantTurn), "Hai");
     assert.deepEqual(chatReducer(turns, { type: "reset" }), []);
+  });
+});
+
+describe("describeChatError (kartu error)", () => {
+  const PROVIDERS: ProviderInfo[] = [
+    { name: "anthropic", label: "Claude", model: "claude-sonnet-5-5", configured: true },
+    { name: "openai", label: "GPT", model: "gpt-5.6-terra", configured: true },
+  ];
+
+  function meta(provider: ProviderName): ChatStreamEvent {
+    const info = PROVIDERS.find((p) => p.name === provider)!;
+    return { type: "meta", provider, model: info.model, label: info.label, searchQuery: "q", rewritten: false };
+  }
+
+  function streamError(provider: ProviderName, retryable = false): ChatStreamEvent {
+    return { type: "error", code: "provider_error", message: "OpenAI (embedding): API key tidak valid.", retryable, provider };
+  }
+
+  function chatTurn(provider: ProviderName): AssistantTurn {
+    const label = PROVIDERS.find((p) => p.name === provider)!.label;
+    return createAssistantTurn({ id: "a1", replyTo: "u1", question: "Q?", provider, label });
+  }
+
+  function cardFor(turn: AssistantTurn, providers = PROVIDERS) {
+    return describeChatError(turn, turn.error!, providers);
+  }
+
+  it("embedding gagal saat Claude dipilih: judul menyebut embedding, tanpa retry ke GPT & tanpa ganti provider", () => {
+    const turn = applyAll(chatTurn("anthropic"), [meta("anthropic"), streamError("openai")]);
+    assert.equal(isEmbeddingFailure(turn), true);
+    const card = cardFor(turn);
+    assert.equal(card.title, "Embedding (OpenAI) gagal");
+    assert.equal(card.canRetry, false); // retryable=false (key salah)
+    assert.equal(card.alternative, null);
+  });
+
+  it("embedding gagal saat GPT dipilih (provider sama) tetap dikenali dari urutan meta → sources", () => {
+    const turn = applyAll(chatTurn("openai"), [meta("openai"), streamError("openai", true)]);
+    assert.equal(isEmbeddingFailure(turn), true);
+    const card = cardFor(turn);
+    assert.equal(card.title, "Embedding (OpenAI) gagal");
+    assert.equal(card.canRetry, true);
+    assert.equal(card.alternative, null, "Claude juga butuh embedding OpenAI — jangan ditawarkan");
+  });
+
+  it("provider chat gagal setelah sources: retry + tawaran provider lain", () => {
+    const turn = applyAll(chatTurn("anthropic"), [
+      meta("anthropic"),
+      { type: "sources", sources: [] },
+      { type: "error", code: "provider_error", message: "Claude: overloaded", retryable: true, provider: "anthropic" },
+    ]);
+    assert.equal(isEmbeddingFailure(turn), false);
+    const card = cardFor(turn);
+    assert.equal(card.title, "Claude gagal menjawab");
+    assert.equal(card.canRetry, true);
+    assert.equal(card.alternative?.name, "openai");
+  });
+
+  it("API key provider chat kosong (503 sebelum stream): tanpa 'Coba lagi', tapi tetap tawarkan provider lain", () => {
+    const error: ChatErrorInfo = {
+      code: "provider_error",
+      message: "ANTHROPIC_API_KEY belum di-set di server",
+      retryable: false,
+      provider: "anthropic",
+    };
+    const turn = failTurn(chatTurn("anthropic"), error);
+    const card = cardFor(turn);
+    assert.equal(card.title, "Claude gagal menjawab");
+    assert.equal(card.canRetry, false);
+    assert.equal(card.alternative?.name, "openai");
+
+    const unconfigured = PROVIDERS.map((p) => (p.name === "openai" ? { ...p, configured: false } : p));
+    assert.equal(cardFor(turn, unconfigured).alternative, null);
+  });
+
+  it("rate limit: pesan statis tanpa angka detik yang membeku (hitung mundur ada di tombol)", () => {
+    const turn = failTurn(chatTurn("anthropic"), {
+      code: "rate_limited",
+      message: "Terlalu banyak pertanyaan. Coba lagi dalam 57 detik.",
+      retryable: true,
+      retryAt: Date.now() + 57_000,
+    });
+    const card = cardFor(turn);
+    assert.equal(card.title, "Terlalu banyak pertanyaan");
+    assert.ok(!card.message.includes("57"));
+    assert.ok(card.message.includes(String(CHAT_RATE_LIMIT.max)));
+    assert.equal(card.canRetry, true);
+    assert.equal(card.alternative, null);
+  });
+
+  it("retry disembunyikan untuk daily_limit, unauthorized, dan error non-retryable", () => {
+    for (const error of [
+      { code: "daily_limit", message: "x", retryable: true },
+      { code: "unauthorized", message: "x", retryable: true },
+      { code: "config_error", message: "SUPABASE_URL belum di-set", retryable: false },
+    ] satisfies ChatErrorInfo[]) {
+      assert.equal(cardFor(failTurn(chatTurn("anthropic"), error)).canRetry, false, error.code);
+    }
+    const network = finishTurn(chatTurn("anthropic"), "ended");
+    assert.equal(cardFor(network).canRetry, true);
   });
 });

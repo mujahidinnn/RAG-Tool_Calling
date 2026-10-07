@@ -203,6 +203,14 @@ comment on function public.match_chunks(vector, int, uuid) is
 -- bisa sama-sama menghitung 4 dokumen, lalu sama-sama insert → 6 dokumen.
 -- Advisory lock per sesi membuat count+insert untuk sesi yang sama antre satu
 -- per satu; sesi lain tidak ikut menunggu.
+-- Di bawah lock yang sama, nama file dibuat unik per sesi ("a.pdf" →
+-- "a (2).pdf"): sitasi [nama_file, chunk #n] harus menunjuk tepat 1 dokumen,
+-- dan cek nama di route (sebelum upload body yang lama) tidak atomic.
+-- p_max_total_docs (opsional) = batas dokumen di SELURUH server: sesi baru
+-- mudah dibuat, jadi batas per sesi saja tidak melindungi kuota database.
+-- Versi lama fungsi ini (7 parameter) dibuang supaya tidak jadi overload ganda.
+drop function if exists public.create_document(uuid, uuid, text, text, text, int, int);
+
 create or replace function public.create_document(
   p_id uuid,
   p_session_id uuid,
@@ -210,7 +218,8 @@ create or replace function public.create_document(
   p_storage_path text,
   p_mime_type text,
   p_size_bytes int,
-  p_max_docs int
+  p_max_docs int,
+  p_max_total_docs int default null
 )
 returns public.documents
 language plpgsql
@@ -220,11 +229,18 @@ as $$
 declare
   v_count int;
   v_doc public.documents;
+  v_ext text;
+  v_base text;
+  v_filename text;
+  v_suffix int := 2;
 begin
   -- Tanpa guard ini, p_max_docs NULL membuat `v_count >= NULL` bernilai NULL
   -- (bukan true) → limit diam-diam tidak berlaku.
   if p_max_docs is null or p_max_docs < 1 then
     raise exception 'invalid_max_docs' using errcode = '22023';
+  end if;
+  if p_filename is null or btrim(p_filename) = '' then
+    raise exception 'invalid_filename' using errcode = '22023';
   end if;
 
   -- Lock 2-kunci: kunci pertama = "namespace" fungsi ini, supaya tidak bentrok
@@ -236,6 +252,17 @@ begin
     hashtext(p_session_id::text)
   );
 
+  -- Batas global: count tanpa lock global (2 sesi paralel bisa melewatinya
+  -- 1-2 dokumen) — cukup untuk melindungi kuota, tanpa membuat semua upload antre.
+  if p_max_total_docs is not null then
+    select count(*) into v_count from public.documents;
+    if v_count >= p_max_total_docs then
+      raise exception 'global_document_limit_reached'
+        using errcode = 'P0001',
+              detail = format('Server sudah menyimpan %s dokumen (maks %s).', v_count, p_max_total_docs);
+    end if;
+  end if;
+
   select count(*) into v_count
   from public.documents
   where session_id = p_session_id;
@@ -246,8 +273,21 @@ begin
             detail = format('Sesi ini sudah punya %s dokumen (maks %s).', v_count, p_max_docs);
   end if;
 
+  -- Ekstensi dipisah dengan aturan yang sama seperti uniqueFilename() di
+  -- lib/server/upload.ts: /\.[a-z0-9]{1,10}$/i.
+  v_ext := coalesce(substring(p_filename from '\.[A-Za-z0-9]{1,10}$'), '');
+  v_base := left(p_filename, length(p_filename) - length(v_ext));
+  v_filename := p_filename;
+  while exists (
+    select 1 from public.documents
+    where session_id = p_session_id and lower(filename) = lower(v_filename)
+  ) loop
+    v_filename := format('%s (%s)%s', v_base, v_suffix, v_ext);
+    v_suffix := v_suffix + 1;
+  end loop;
+
   insert into public.documents (id, session_id, filename, storage_path, mime_type, size_bytes)
-  values (p_id, p_session_id, p_filename, p_storage_path, p_mime_type, p_size_bytes)
+  values (p_id, p_session_id, v_filename, p_storage_path, p_mime_type, p_size_bytes)
   returning * into v_doc;
 
   return v_doc;

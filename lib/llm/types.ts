@@ -14,7 +14,16 @@ export type ProviderName = "anthropic" | "openai";
  * data ini, lalu menaruh hasilnya di format asli provider.
  */
 export type Message =
-  | { role: "user" | "assistant"; content: string }
+  | {
+      role: "user" | "assistant";
+      content: string;
+      /**
+       * Hanya untuk `assistant` di DALAM 1 loop tool (1 request /api/chat):
+       * isi giliran asli provider yang harus dikirim balik apa adanya
+       * (lihat AssistantReplay). Riwayat dari UI tidak pernah membawanya.
+       */
+      replay?: AssistantReplay;
+    }
   | {
       role: "tool";
       toolCallId: string;
@@ -22,7 +31,30 @@ export type Message =
       input: unknown;
       /** Hasil eksekusi tool dalam bentuk string (biasanya JSON). */
       content: string;
+      /** true kalau tool GAGAL — Anthropic menerimanya sebagai `is_error: true`. */
+      isError?: boolean;
     };
+
+/**
+ * Blok konten giliran assistant Anthropic yang dikirim balik tanpa diubah.
+ * Bentuknya sama dengan tipe param SDK (ThinkingBlockParam dst.), ditulis
+ * ulang di sini supaya file ini tetap tanpa import SDK.
+ */
+export type AnthropicReplayBlock =
+  | { type: "thinking"; thinking: string; signature: string }
+  | { type: "redacted_thinking"; data: string }
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+
+/**
+ * Giliran assistant persis seperti dihasilkan provider, untuk dikirim balik
+ * di ronde tool berikutnya. Kenapa perlu: Claude (adaptive thinking) memberi
+ * blok `thinking` bertanda tangan sebelum tool_use; dokumentasi Claude
+ * meminta blok itu dikirim balik TANPA diubah selama loop tool supaya model
+ * tidak kehilangan penalarannya di antara ronde. Riwayat generik kita (teks
+ * + pesan `tool`) tidak bisa membawanya, jadi disimpan utuh di sini.
+ */
+export type AssistantReplay = { provider: "anthropic"; blocks: AnthropicReplayBlock[] };
 
 /** JSON Schema objek (subset) — dipakai apa adanya oleh kedua provider. */
 export type JsonSchemaObject = {
@@ -39,11 +71,26 @@ export type Tool = {
   input_schema: JsonSchemaObject;
 };
 
-/** 3 event generik hasil penyeragaman stream Anthropic & OpenAI. */
+/**
+ * Event generik hasil penyeragaman stream Anthropic & OpenAI: 3 event inti
+ * (text | tool_call | done) + `replay` (khusus loop tool, lihat AssistantReplay).
+ */
 export type StreamEvent =
   | { type: "text"; delta: string }
   | { type: "tool_call"; id: string; name: string; input: unknown }
-  | { type: "done"; inputTokens: number; outputTokens: number };
+  /** Dikirim sebelum event tool_call kalau giliran ini perlu dikirim balik utuh. */
+  | { type: "replay"; replay: AssistantReplay }
+  | {
+      type: "done";
+      inputTokens: number;
+      outputTokens: number;
+      /**
+       * true = jawaban berhenti karena batas panjang output (Anthropic
+       * `max_tokens` / `model_context_window_exceeded`, OpenAI `length`),
+       * bukan karena model selesai. Tidak ada = selesai normal.
+       */
+      truncated?: boolean;
+    };
 
 export type ChatOptions = {
   /**
@@ -94,11 +141,20 @@ export type ProviderErrorCode =
  * error ini diteruskan apa adanya ke UI supaya user tahu provider mana yang
  * gagal dan kenapa (penting untuk observability).
  */
+export type TokenUsage = { inputTokens: number; outputTokens: number };
+
 export class ProviderError extends Error {
   readonly provider: ProviderName;
   readonly code: ProviderErrorCode;
+  /** HTTP status dari provider. Ada = request ditolak SEBELUM stream dimulai. */
   readonly status?: number;
   readonly retryable: boolean;
+  /**
+   * Token yang SUDAH dilaporkan provider sebelum error dilempar (mis.
+   * refusal atau output terpotong saat menyusun tool call — provider tetap
+   * menagihnya). Ada = pakai angka ini, bukan estimasi.
+   */
+  readonly usage?: TokenUsage;
 
   constructor(opts: {
     provider: ProviderName;
@@ -106,6 +162,7 @@ export class ProviderError extends Error {
     message: string;
     status?: number;
     retryable?: boolean;
+    usage?: TokenUsage;
     cause?: unknown;
   }) {
     super(opts.message, { cause: opts.cause });
@@ -113,6 +170,7 @@ export class ProviderError extends Error {
     this.provider = opts.provider;
     this.code = opts.code;
     this.status = opts.status;
+    this.usage = opts.usage;
     this.retryable =
       opts.retryable ??
       (opts.code === "rate_limit" ||

@@ -7,17 +7,18 @@ import "server-only";
 // "baca cost_usd → bandingkan di JS → tulis balik": 2 request bersamaan bisa
 // sama-sama lolos cek sebelum salah satu sempat menulis.
 //
-// Alur untuk chat (biaya baru diketahui setelah LLM selesai):
-//   1. reserveBudget(estimasi)  → pesan "jatah" dulu; ditolak kalau melebihi budget
-//   2. ...panggil LLM...
+// Alur (biaya baru diketahui setelah LLM/embedding selesai):
+//   1. reserveBudget(biaya maksimal) → pesan "jatah" dulu; ditolak kalau melebihi budget
+//      (chat memesan lagi sebelum tiap panggilan LLM tambahan — lib/server/budget.ts)
+//   2. ...panggil LLM / embedding...
 //   3. settleUsage(reservasi, aktual) → koreksi: catat token & selisih biaya
-// Untuk embedding (biaya kecil, sudah diketahui): recordUsage(aktual).
+// recordUsage(aktual) hanya untuk biaya yang sudah terjadi tanpa reservasi.
 
 import { z } from "zod";
 import { getServerEnv } from "@/lib/env";
 import { getSupabase } from "@/lib/supabase/client";
 
-export const DAILY_LIMIT_MESSAGE = "Demo limit harian tercapai, coba lagi besok.";
+export { DAILY_LIMIT_MESSAGE } from "./budget";
 
 export type Reservation = {
   /** Tanggal (UTC, YYYY-MM-DD) baris usage_daily yang dipesan. */
@@ -95,24 +96,43 @@ async function callRecordUsage(day: string | null, tokens: number, costDeltaUsd:
 }
 
 /**
- * Selesaikan reservasi: catat token aktual dan selisih biaya
- * (aktual - estimasi; biasanya negatif = sisa jatah dikembalikan).
- * Tidak pernah throw — dipanggil di `finally` stream chat; kegagalan dicatat.
+ * Selesaikan reservasi (1 atau beberapa — chat memesan bertahap): catat
+ * token aktual dan selisih biaya (aktual - total dipesan; biasanya negatif =
+ * sisa jatah dikembalikan). Panggil TEPAT 1x per kumpulan reservasi.
+ * Tidak pernah throw — dipanggil di `finally`; kegagalan dicatat.
  */
-export async function settleUsage(reservation: Reservation, actual: UsageActual): Promise<void> {
-  try {
-    const clean = sanitizeActual(actual);
-    if (clean === null) {
-      // Jangan refund kalau angka aktual rusak: jatah yang sudah dipesan tetap
-      // terhitung (aman untuk budget), cukup dicatat di log.
-      console.error("[usage] settleUsage: angka aktual tidak valid, reservasi dibiarkan", actual);
-      return;
+export async function settleUsage(
+  reservations: Reservation | readonly Reservation[],
+  actual: UsageActual,
+): Promise<void> {
+  const list: readonly Reservation[] = "day" in reservations ? [reservations] : reservations;
+  const clean = sanitizeActual(actual);
+  if (clean === null) {
+    // Jangan refund kalau angka aktual rusak: jatah yang sudah dipesan tetap
+    // terhitung (aman untuk budget), cukup dicatat di log.
+    console.error("[usage] settleUsage: angka aktual tidak valid, reservasi dibiarkan", actual);
+    return;
+  }
+  const firstDay = list[0]?.day ?? null;
+  if (firstDay === null) {
+    await recordUsage(clean);
+    return;
+  }
+
+  // Dikelompokkan per tanggal reservasi (bukan "hari ini") supaya refund masuk
+  // ke hari yang benar walau request melewati tengah malam UTC. Biaya aktual
+  // dibukukan ke hari reservasi PERTAMA; hari lain hanya menerima refund.
+  const reservedByDay = new Map<string, number>();
+  for (const reservation of list) {
+    reservedByDay.set(reservation.day, (reservedByDay.get(reservation.day) ?? 0) + reservation.reservedUsd);
+  }
+  for (const [day, reservedUsd] of reservedByDay) {
+    const isFirst = day === firstDay;
+    try {
+      await callRecordUsage(day, isFirst ? clean.tokens : 0, (isFirst ? clean.costUsd : 0) - reservedUsd);
+    } catch (err) {
+      console.error("[usage] settleUsage gagal:", err instanceof Error ? err.message : err);
     }
-    // Tanggal reservasi (bukan "hari ini") supaya refund masuk ke hari yang
-    // benar walau request selesai setelah tengah malam UTC.
-    await callRecordUsage(reservation.day, clean.tokens, clean.costUsd - reservation.reservedUsd);
-  } catch (err) {
-    console.error("[usage] settleUsage gagal:", err instanceof Error ? err.message : err);
   }
 }
 

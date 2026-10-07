@@ -86,6 +86,37 @@ describe("createRateLimiter", () => {
   });
 });
 
+describe("createRateLimiter — peek", () => {
+  it("peek tidak mencatat request; hanya check yang menghabiskan slot", () => {
+    const limiter = createRateLimiter({ max: 2, windowMs: 60_000 });
+    for (let i = 0; i < 5; i++) {
+      assert.deepEqual(limiter.peek("g", T0 + i), { allowed: true, remaining: 2, retryAfterSec: 0 });
+    }
+    assert.equal(limiter.size(), 0, "peek tidak boleh membuat key baru di memori");
+    limiter.check("g", T0);
+    limiter.check("g", T0 + 1);
+    const blocked = limiter.peek("g", T0 + 2);
+    assert.equal(blocked.allowed, false);
+    assert.equal(blocked.retryAfterSec, 60);
+    // Setelah window lewat, peek kembali mengizinkan.
+    assert.equal(limiter.peek("g", T0 + 60_001).allowed, true);
+  });
+
+  it("pola limiter global passcode salah: rotasi sesi/IP tidak membantu penyerang", () => {
+    // Simulasi: peek dulu (tolak kalau penuh), catat hanya saat passcode salah.
+    const failures = createRateLimiter({ max: 3, windowMs: 60_000 });
+    let rejected = 0;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      if (!failures.peek("global", T0 + attempt).allowed) {
+        rejected++;
+        continue;
+      }
+      failures.check("global", T0 + attempt); // passcode salah
+    }
+    assert.equal(rejected, 7, "hanya 3 tebakan salah per window, berapa pun key sesi/IP-nya");
+  });
+});
+
 describe("limiter bawaan", () => {
   it("chatRateLimiter: 20 request/menit per sesi, request ke-21 ditolak (spec §2 & §10)", () => {
     assert.deepEqual(CHAT_RATE_LIMIT, { max: 20, windowMs: 60_000 });

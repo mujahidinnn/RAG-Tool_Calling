@@ -38,7 +38,7 @@ export function ToolResultCard({ name, result }: Props) {
           <Wrench aria-hidden="true" className="size-3" />
         </span>
         <span className="text-xs font-medium text-zinc-700 dark:text-zinc-300">{TOOL_TITLES[name] ?? "Tool call"}</span>
-        <code className="hidden truncate font-mono text-[0.6875rem] text-zinc-400 sm:inline dark:text-zinc-500">{name}</code>
+        <code className="hidden truncate font-mono text-[0.6875rem] text-zinc-500 sm:inline dark:text-zinc-400">{name}</code>
         <span className="ml-auto flex shrink-0 items-center gap-1 text-[0.6875rem] text-zinc-500 dark:text-zinc-400">
           {running ? (
             <>
@@ -92,7 +92,7 @@ function ResultBody({ payload }: { payload: ToolCardPayload }) {
                   <span className="min-w-0 flex-1 truncate text-zinc-700 dark:text-zinc-300" title={doc.filename}>
                     {doc.filename}
                   </span>
-                  <span className="hidden shrink-0 text-zinc-400 tabular-nums sm:inline dark:text-zinc-500">
+                  <span className="hidden shrink-0 text-zinc-500 tabular-nums sm:inline dark:text-zinc-400">
                     {formatBytes(doc.sizeBytes)}
                     {doc.status === "ready" ? ` · ${doc.chunkCount} chunk` : ""}
                   </span>

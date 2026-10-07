@@ -9,14 +9,14 @@ import { CHUNK_TOKENS, SUMMARY_MAX_INPUT_TOKENS } from "@/lib/config";
 import { collectStream } from "@/lib/llm";
 import type { Tool } from "@/lib/llm/types";
 import { SUMMARY_SYSTEM_PROMPT, formatContext } from "@/lib/rag/prompt";
+import { DAILY_LIMIT_MESSAGE, llmCallReserveUsd } from "@/lib/server/budget";
 import { DOCUMENT_COLUMNS, documentRowSchema } from "@/lib/server/documents";
-import { estimateTokens, mayHaveBeenBilled } from "@/lib/server/usage-estimate";
+import { estimateTokens, usageAfterFailure } from "@/lib/server/usage-estimate";
 import { isValidUuid } from "@/lib/server/uuid";
 import { getSupabase } from "@/lib/supabase/client";
 import type { Source } from "@/lib/types";
 
 import {
-  NO_USAGE,
   pickEvenlySpaced,
   toolErrorResult,
   withAbortSignal,
@@ -157,7 +157,19 @@ export async function runSummarizeDocument(
     "Buat ringkasan dokumen ini.",
   ].join("\n");
 
+  // Pesan budget harian untuk panggilan LLM ini SEBELUM memanggilnya: 1
+  // pertanyaan bisa memicu beberapa ringkasan, masing-masing ±12k token input.
+  const promptForModel = SUMMARY_SYSTEM_PROMPT + prompt;
+  if (ctx.reserveBudget) {
+    const cost = llmCallReserveUsd(ctx.provider.model, promptForModel, SUMMARY_MAX_OUTPUT_TOKENS);
+    if (!(await ctx.reserveBudget(cost))) {
+      return toolErrorResult(`Ringkasan "${doc.filename}" tidak dibuat: ${DAILY_LIMIT_MESSAGE}`);
+    }
+  }
+
   let result: Awaited<ReturnType<typeof collectStream>>;
+  // Teks yang sudah keluar — kalau stream gagal di tengah, token output-nya tetap ditagih.
+  let partialText = "";
   try {
     result = await collectStream(
       ctx.provider.streamChat([{ role: "user", content: prompt }], "", undefined, {
@@ -165,13 +177,14 @@ export async function runSummarizeDocument(
         maxOutputTokens: SUMMARY_MAX_OUTPUT_TOKENS,
         signal: ctx.signal,
       }),
+      (event) => {
+        if (event.type === "text") partialText += event.delta;
+      },
     );
   } catch (err) {
-    // Angka token tidak pernah datang kalau stream gagal → catat estimasi
-    // input (lihat lib/server/usage-estimate.ts) supaya daily cap tetap jujur.
-    const usage = mayHaveBeenBilled(err)
-      ? { inputTokens: estimateTokens(SUMMARY_SYSTEM_PROMPT + prompt), outputTokens: 0 }
-      : NO_USAGE;
+    // Angka token dari provider (kalau sempat dilaporkan) atau estimasi —
+    // lihat lib/server/usage-estimate.ts — supaya daily cap tetap jujur.
+    const usage = usageAfterFailure(err, promptForModel, partialText);
     const isProviderError = err instanceof Error && err.name === "ProviderError";
     if (!isProviderError) console.error("[tools] get_document_summary gagal:", err);
     // Pesan ProviderError memang dibuat untuk ditampilkan (menyebut provider & sebabnya).
@@ -179,7 +192,10 @@ export async function runSummarizeDocument(
     return toolErrorResult(`Gagal membuat ringkasan "${doc.filename}": ${reason}`, usage);
   }
 
-  const usage = { inputTokens: result.inputTokens, outputTokens: result.outputTokens };
+  // Provider tidak melaporkan token (stream terganggu di akhir) ≠ gratis → estimasi.
+  const usage = result.usageReported
+    ? { inputTokens: result.inputTokens, outputTokens: result.outputTokens }
+    : { inputTokens: estimateTokens(promptForModel), outputTokens: estimateTokens(result.text) };
   const summary = result.text.trim();
   if (summary === "") {
     return toolErrorResult(`Model tidak menghasilkan ringkasan untuk "${doc.filename}". Coba lagi.`, usage);

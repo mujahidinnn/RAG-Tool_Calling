@@ -9,10 +9,11 @@
 // (tests/chat-stream.test.ts). app/api/chat/route.ts yang menyambungkan
 // implementasi aslinya.
 
-import { MAX_TOOL_ROUNDS } from "@/lib/config";
+import { MAX_OUTPUT_TOKENS, MAX_TOOL_ROUNDS } from "@/lib/config";
 import { chatCostUsd } from "@/lib/llm/pricing";
 import {
   ProviderError,
+  type AssistantReplay,
   type ChatOptions,
   type ChatProvider,
   type Message,
@@ -26,11 +27,12 @@ import {
 } from "@/lib/rag/prompt";
 import type { RetrieveResult } from "@/lib/rag/retrieve";
 import type { RewriteResult } from "@/lib/rag/rewrite";
-import { toolErrorResult, type ToolContext, type ToolExecutionResult } from "@/lib/tools/shared";
+import { NO_USAGE, toolErrorResult, type ToolContext, type ToolExecutionResult } from "@/lib/tools/shared";
 import type { ChatHistoryMessage, ChatStreamEvent } from "@/lib/types";
 
+import { DAILY_LIMIT_MESSAGE, DailyLimitError, llmCallReserveUsd } from "./budget";
 import { encodeSseEvent } from "./sse";
-import { estimateTokens, mayHaveBeenBilled } from "./usage-estimate";
+import { usageAfterFailure } from "./usage-estimate";
 
 /**
  * Batas waktu total 1 pertanyaan. Sengaja di bawah maxDuration route (60
@@ -51,6 +53,9 @@ export const MAX_TOOL_CALLS_PER_ROUND = 5;
 const FINAL_ROUND_INSTRUCTION =
   "\n\nPENTING: batas pemanggilan tool untuk pertanyaan ini sudah tercapai. JANGAN memanggil tool lagi — " +
   "jawab sekarang hanya dengan informasi dari Context dan hasil tool sebelumnya.";
+/** Ditambahkan ke jawaban yang berhenti karena batas panjang output (bukan karena selesai). */
+export const TRUNCATED_NOTICE =
+  "_(Jawaban terpotong karena mencapai batas panjang output. Minta lanjutannya, atau ajukan pertanyaan yang lebih spesifik.)_";
 const DEADLINE_MESSAGE = `Waktu pemrosesan habis (lebih dari ${Math.round(CHAT_DEADLINE_MS / 1000)} detik). Coba lagi, atau ajukan pertanyaan yang lebih spesifik.`;
 const INTERNAL_MESSAGE = "Terjadi kesalahan di server saat memproses pertanyaan. Coba lagi sebentar lagi.";
 
@@ -81,7 +86,14 @@ export type ChatStreamDeps = {
   executeTool: (name: string, input: unknown, ctx: ToolContext) => Promise<ToolExecutionResult>;
   /** Definisi tool generik (TOOLS dari lib/tools). */
   tools: Tool[];
-  /** Selesaikan reservasi budget. Dipanggil TEPAT 1x per stream — juga saat error/abort. */
+  /**
+   * Pesan budget TAMBAHAN sebelum tiap panggilan LLM setelah reservasi awal
+   * route (ronde tool berikutnya, ringkasan dokumen). false = budget habis.
+   * Implementasi wajib fail-closed (error DB → false) dan menggabungkan
+   * reservasinya ke reservasi yang di-settle oleh `settleUsage`.
+   */
+  reserveMore: (costUsd: number) => Promise<boolean>;
+  /** Selesaikan SEMUA reservasi budget. Dipanggil TEPAT 1x per stream — juga saat error/abort. */
   settleUsage: (actual: { tokens: number; costUsd: number }) => Promise<void>;
 };
 
@@ -112,12 +124,13 @@ class UsageTally {
   }
 
   /**
-   * Panggilan LLM yang gagal sebelum sempat melaporkan token: catat
-   * estimasi kalau kemungkinan tetap ditagih (alasan: lib/server/usage-estimate.ts).
+   * Panggilan LLM yang gagal sebelum sempat melaporkan token lewat `done`:
+   * pakai angka yang dibawa error kalau ada, selain itu estimasi kalau
+   * kemungkinan tetap ditagih (alasan: lib/server/usage-estimate.ts).
    */
   addEstimate(err: unknown, promptText: string, outputText: string): void {
-    if (!mayHaveBeenBilled(err)) return;
-    this.addLlm(estimateTokens(promptText), estimateTokens(outputText));
+    const usage = usageAfterFailure(err, promptText, outputText);
+    this.addLlm(usage.inputTokens, usage.outputTokens);
   }
 
   totals(): { inputTokens: number; outputTokens: number; costUsd: number } {
@@ -137,6 +150,12 @@ type Run = {
   usage: UsageTally;
   /** Semua teks jawaban yang sudah dikirim ke client (untuk jeda antar ronde). */
   textSent: string;
+  /**
+   * Hasil tool per (nama + input) dalam pertanyaan ini. Panggilan yang sama
+   * persis (mis. ringkasan dokumen yang sama diminta berulang — bisa dipicu
+   * prompt injection) memakai hasil pertama tanpa biaya LLM lagi.
+   */
+  toolResults: Map<string, Promise<ToolExecutionResult>>;
 };
 
 /**
@@ -173,7 +192,13 @@ export function createChatStream(input: ChatStreamInput, deps: ChatStreamDeps): 
         abort.abort();
       }, input.deadlineMs ?? CHAT_DEADLINE_MS);
 
-      const run: Run = { signal: abort.signal, send, usage: new UsageTally(input.provider.model), textSent: "" };
+      const run: Run = {
+        signal: abort.signal,
+        send,
+        usage: new UsageTally(input.provider.model),
+        textSent: "",
+        toolResults: new Map(),
+      };
       try {
         await answerQuestion(input, deps, run);
       } catch (err) {
@@ -267,7 +292,13 @@ async function runToolLoop(
 ): Promise<void> {
   const { provider } = input;
   const messages: Message[] = [...input.history, { role: "user", content: input.question }];
-  const toolContext: ToolContext = { sessionId: input.sessionId, provider, signal: run.signal };
+  const toolContext: ToolContext = {
+    sessionId: input.sessionId,
+    provider,
+    signal: run.signal,
+    // Tool yang memanggil LLM (ringkasan) memesan budget-nya sendiri.
+    reserveBudget: (costUsd) => (run.signal.aborted ? Promise.resolve(false) : deps.reserveMore(costUsd)),
+  };
 
   // Ronde 0..MAX_TOOL_ROUNDS-1 boleh memakai tool; ronde terakhir harus menjawab.
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
@@ -283,8 +314,24 @@ async function runToolLoop(
           toolChoice: "none",
         }
       : { signal: run.signal };
+    // System prompt ronde terakhir BERBEDA dari ronde sebelumnya. Claude
+    // mengikat tiap blok thinking ke system prompt + riwayat saat blok itu
+    // dibuat; mengirim balik blok lama setelah system prompt berubah ditolak
+    // (400) di akun baru. Jadi di ronde ini blok thinking tidak dikirim balik
+    // (riwayat tanpa thinking selalu diterima API). Selalu salinan: `messages`
+    // bertambah setelah ronde ini selesai.
+    const roundMessages = isFinalRound ? messages.map(withoutReplay) : messages.slice();
 
-    const { text, toolCalls } = await streamRound(provider, messages, context, deps.tools, options, run);
+    // Ronde 0 sudah dipesan route (reservasi awal). Ronde berikutnya memesan
+    // biaya maksimalnya sendiri — tanpa ini, banyak ronde + ringkasan dalam
+    // 1 pertanyaan bisa jauh melewati jatah yang dipesan di awal.
+    if (round > 0) {
+      const system = options.system ?? buildSystemPrompt(context);
+      const cost = llmCallReserveUsd(provider.model, promptText(system, roundMessages, deps.tools), MAX_OUTPUT_TOKENS);
+      if (!(await deps.reserveMore(cost))) throw new DailyLimitError();
+    }
+
+    const { text, toolCalls, replay } = await streamRound(provider, roundMessages, context, deps.tools, options, run);
 
     // Tanpa tool call = model sudah selesai menjawab.
     if (toolCalls.length === 0) return;
@@ -302,8 +349,11 @@ async function runToolLoop(
 
     // Catat giliran model ini ke riwayat: teksnya (kalau ada) lalu 1 pesan
     // `tool` per panggilan. Adapter merekonstruksi tool_use/tool_calls dari
-    // pesan `tool` ini (lihat lib/llm/translate.ts).
-    if (text.trim() !== "") messages.push({ role: "assistant", content: text });
+    // pesan `tool` ini (lihat lib/llm/translate.ts) — atau, kalau ada
+    // `replay`, mengirim giliran asli provider apa adanya (blok thinking).
+    if (text.trim() !== "" || replay) {
+      messages.push({ role: "assistant", content: text, ...(replay ? { replay } : {}) });
+    }
     const results = await executeToolCalls(toolCalls, deps, toolContext, run);
     toolCalls.forEach((call, index) => {
       const result = results[index];
@@ -314,12 +364,18 @@ async function runToolLoop(
         toolName: call.name,
         input: call.input,
         content: result.content,
+        ...(result.payload.kind === "error" ? { isError: true } : {}),
       });
     });
 
     // Client pergi selama tool berjalan → jangan mulai ronde LLM baru.
     run.signal.throwIfAborted();
   }
+}
+
+function withoutReplay(message: Message): Message {
+  if (message.role === "tool" || message.replay === undefined) return message;
+  return { role: message.role, content: message.content };
 }
 
 /** 1 panggilan streamChat: teks diteruskan ke client SEGERA, tool call & usage dikumpulkan. */
@@ -330,22 +386,26 @@ async function streamRound(
   tools: Tool[],
   options: ChatOptions,
   run: Run,
-): Promise<{ text: string; toolCalls: ToolCall[] }> {
+): Promise<{ text: string; toolCalls: ToolCall[]; replay: AssistantReplay | undefined }> {
   let text = "";
   const toolCalls: ToolCall[] = [];
+  let replay: AssistantReplay | undefined;
   let usageReported = false;
+  let truncated = false;
 
   try {
-    // Salinan riwayat: kita menambah pesan setelah ronde ini selesai.
-    for await (const event of provider.streamChat(messages.slice(), context, tools, options)) {
+    for await (const event of provider.streamChat(messages, context, tools, options)) {
       if (event.type === "text") {
         forwardText(run, event.delta, text === "");
         text += event.delta;
       } else if (event.type === "tool_call") {
         toolCalls.push({ id: event.id, name: event.name, input: event.input });
+      } else if (event.type === "replay") {
+        replay = event.replay;
       } else {
         run.usage.addLlm(event.inputTokens, event.outputTokens);
         usageReported = true;
+        truncated = event.truncated === true;
       }
     }
   } catch (err) {
@@ -356,12 +416,19 @@ async function streamRound(
     throw err;
   }
 
-  // Adapter seharusnya selalu mengirim `done`; kalau tidak, tetap catat estimasi.
+  // Adapter seharusnya selalu mengirim `done`; kalau tidak (mis. chunk usage
+  // OpenAI tidak sempat datang), tetap catat estimasi.
   if (!usageReported) {
     const system = options.system ?? buildSystemPrompt(context);
     run.usage.addEstimate(null, promptText(system, messages, tools), text + JSON.stringify(toolCalls));
   }
-  return { text, toolCalls };
+
+  // Jawaban yang berhenti karena batas output tidak boleh tampil seolah
+  // lengkap (dan masuk riwayat follow-up begitu saja) → beri tanda jelas.
+  if (truncated && toolCalls.length === 0) {
+    forwardText(run, text === "" ? TRUNCATED_NOTICE : `\n\n${TRUNCATED_NOTICE}`, text === "");
+  }
+  return { text, toolCalls, replay };
 }
 
 function forwardText(run: Run, delta: string, isFirstDeltaOfRound: boolean): void {
@@ -394,7 +461,7 @@ async function executeToolCalls(
       // mewajibkan setiap tool call punya hasil di giliran berikutnya.
       const result =
         index < MAX_TOOL_CALLS_PER_ROUND
-          ? await executeToolSafely(call, deps, ctx)
+          ? await executeToolOnce(call, deps, ctx, run)
           : toolErrorResult(
               `Terlalu banyak pemanggilan tool sekaligus (maks ${MAX_TOOL_CALLS_PER_ROUND} per langkah); panggilan ini dilewati.`,
             );
@@ -402,6 +469,24 @@ async function executeToolCalls(
       return result;
     }),
   );
+}
+
+/** Panggilan identik (nama + input) dalam 1 pertanyaan dieksekusi 1x saja. */
+async function executeToolOnce(
+  call: ToolCall,
+  deps: ChatStreamDeps,
+  ctx: ToolContext,
+  run: Run,
+): Promise<ToolExecutionResult> {
+  const key = `${call.name}\u0000${JSON.stringify(call.input) ?? ""}`;
+  const earlier = run.toolResults.get(key);
+  if (earlier) {
+    // Biaya LLM-nya sudah dihitung di panggilan pertama.
+    return { ...(await earlier), usage: NO_USAGE };
+  }
+  const pending = executeToolSafely(call, deps, ctx);
+  run.toolResults.set(key, pending);
+  return pending;
 }
 
 // executeTool dijanjikan tidak pernah throw; tetap dijaga supaya 1 bug di
@@ -459,6 +544,10 @@ function toErrorEvent(err: unknown, deadlineHit: boolean): Extract<ChatStreamEve
   if (deadlineHit) {
     console.warn("[chat] deadline tercapai — pemrosesan dihentikan.");
     return { type: "error", code: "internal", message: DEADLINE_MESSAGE, retryable: true };
+  }
+  if (err instanceof DailyLimitError) {
+    console.warn("[chat] budget harian habis di tengah pertanyaan — ronde berikutnya dibatalkan.");
+    return { type: "error", code: "daily_limit", message: DAILY_LIMIT_MESSAGE, retryable: false };
   }
   if (isProviderError(err)) {
     // TIDAK ada fallback ke provider lain: error diteruskan apa adanya supaya

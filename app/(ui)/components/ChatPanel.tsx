@@ -18,7 +18,7 @@ import type { DocumentDTO, ProviderInfo, ProviderName } from "@/lib/types";
 import type { SourcesView } from "./ChunkPanel";
 import { AssistantMessage, UserMessage } from "./MessageBubble";
 import { ProviderSelect } from "./ProviderSelect";
-import { Button, IconButton, cx } from "./ui";
+import { Button, IconButton, cx, focusIfKeyboardUser } from "./ui";
 
 type Props = {
   providers: ProviderInfo[];
@@ -171,13 +171,22 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
     (failed: AssistantTurn, providerName: ProviderName) => {
       const stillBusy = turnsRef.current.some((turn) => turn.role === "assistant" && isStreaming(turn));
       if (stillBusy) return;
-      // Kalau user memilih provider lain dari tombol error, dropdown ikut berubah
-      // supaya pertanyaan berikutnya konsisten dengan pilihan itu.
-      setProvider(providerName);
+      // Kalau user memilih provider lain dari tombol error ("Tanya pakai X"),
+      // dropdown ikut berubah supaya pertanyaan berikutnya konsisten dengan
+      // pilihan itu. "Coba lagi" (provider sama) tidak menyentuh dropdown.
+      if (providerName !== failed.provider) setProvider(providerName);
       void run(failed.question, providerName, failed);
+      // Kartu error (berisi tombol yang barusan ditekan) diganti jawaban baru.
+      focusIfKeyboardUser(textareaRef.current);
     },
     [run],
   );
+
+  const resetChat = () => {
+    dispatch({ type: "reset" });
+    // Tombol ini ikut hilang setelah reset → fokus jangan jatuh ke <body>.
+    focusIfKeyboardUser(textareaRef.current);
+  };
 
   const stop = () => abortRef.current?.abort();
 
@@ -208,7 +217,7 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
           </span>
         </div>
         {turns.length > 0 && (
-          <Button variant="ghost" size="sm" onClick={() => dispatch({ type: "reset" })} disabled={busy}>
+          <Button variant="ghost" size="sm" onClick={resetChat} disabled={busy}>
             <RotateCcw aria-hidden="true" />
             <span className="hidden sm:inline">Percakapan baru</span>
             <span className="sm:hidden">Baru</span>
@@ -285,7 +294,7 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
               placeholder="Tanya sesuatu tentang dokumenmu…"
               maxLength={MAX_QUESTION_CHARS}
               aria-describedby="chat-input-hint"
-              className="block max-h-[200px] w-full resize-none bg-transparent px-4 pt-3.5 pb-1.5 text-[0.9375rem] leading-6 text-zinc-900 placeholder:text-zinc-400 focus-visible:outline-none dark:text-zinc-100 dark:placeholder:text-zinc-500"
+              className="block max-h-[200px] w-full resize-none bg-transparent px-4 pt-3.5 pb-1.5 text-[0.9375rem] leading-6 text-zinc-900 placeholder:text-zinc-500 focus-visible:outline-none dark:text-zinc-100 dark:placeholder:text-zinc-400"
             />
             <div className="flex items-center justify-between gap-2 px-2.5 pb-2.5">
               <ProviderSelect providers={providers} value={provider} onChange={setProvider} disabled={busy} />
