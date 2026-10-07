@@ -4,7 +4,7 @@ import "server-only";
 // build GAGAL kalau file ini (atau modul yang mengimpornya) ikut ke bundle
 // client — jadi service role key & API key tidak mungkin bocor ke browser.
 
-import { CHAT_MODELS, DEFAULT_DAILY_BUDGET_USD } from "@/lib/config";
+import { CHAT_MODELS, DEFAULT_DAILY_BUDGET_USD, PROVIDER_LABELS } from "@/lib/config";
 import { EMBEDDING_PRICING, formatUsd } from "@/lib/llm/pricing";
 import { initialChatReserveUsd } from "@/lib/server/budget";
 import type { ProviderName } from "@/lib/llm/types";
@@ -138,15 +138,31 @@ export function getServerEnv(): ServerEnv {
     // tidak bisa membedakan penebak (plafon global sengaja tinggi) — panjang
     // passcode-lah pertahanan sebenarnya. Peringatan saja (bukan error) supaya
     // demo lokal tetap jalan; nilainya TIDAK pernah ditulis ke log.
-    if (cached.demoPasscode.length < 12) {
-      console.warn(
-        "[env] DEMO_PASSCODE kurang dari 12 karakter — mudah ditebak di demo publik. " +
-          "Rate limit hanya memperlambat tebakan; pakai ≥12 karakter acak.",
-      );
-    }
-    warnIfBudgetTooSmall(cached.dailyBudgetUsd);
+    warnOncePerProcess(() => {
+      if (cached === null) return;
+      if (cached.demoPasscode.length < 12) {
+        console.warn(
+          "[env] DEMO_PASSCODE kurang dari 12 karakter — mudah ditebak di demo publik. " +
+            "Rate limit hanya memperlambat tebakan; pakai ≥12 karakter acak.",
+        );
+      }
+      warnIfBudgetTooSmall(cached.dailyBudgetUsd);
+    });
   }
   return cached;
+}
+
+/**
+ * instrumentation.ts dan route handler dibundel terpisah oleh Next, jadi
+ * variabel modul `cached` di atas ada 2 salinan. Penanda di globalThis
+ * memastikan peringatan config tercetak 1x per proses, bukan 1x per bundel.
+ */
+const WARNED_KEY = Symbol.for("ai-docs-assistant.env-warned");
+function warnOncePerProcess(warn: () => void): void {
+  const store = globalThis as Record<symbol, unknown>;
+  if (store[WARNED_KEY]) return;
+  store[WARNED_KEY] = true;
+  warn();
 }
 
 /**
@@ -156,17 +172,23 @@ export function getServerEnv(): ServerEnv {
  * (tes "budget kecil" di spec §10 memang memakai ini), tapi perlu diketahui operator.
  */
 function warnIfBudgetTooSmall(dailyBudgetUsd: number): void {
-  const minimum = Math.max(
-    ...Object.values(CHAT_MODELS).map((model) =>
-      initialChatReserveUsd({ model, question: "", history: [], tools: [] }),
-    ),
+  // Reservasi minimal beda per model (harga beda), jadi cek per provider.
+  const tooSmall = (Object.keys(CHAT_MODELS) as ProviderName[])
+    .map((name) => ({
+      label: PROVIDER_LABELS[name],
+      minimum: initialChatReserveUsd({ model: CHAT_MODELS[name], question: "", history: [], tools: [] }),
+    }))
+    .filter(({ minimum }) => dailyBudgetUsd < minimum);
+  if (tooSmall.length === 0) return;
+  const who =
+    tooSmall.length === Object.keys(CHAT_MODELS).length
+      ? "semua pertanyaan chat"
+      : `pertanyaan ke ${tooSmall.map(({ label }) => label).join(" & ")}`;
+  const detail = tooSmall.map(({ label, minimum }) => `${label} ±${formatUsd(minimum)}`).join(", ");
+  console.warn(
+    `[env] DAILY_BUDGET_USD (${formatUsd(dailyBudgetUsd)}) lebih kecil dari reservasi minimal 1 pertanyaan ` +
+      `(${detail}) — ${who} akan ditolak dengan pesan limit harian.`,
   );
-  if (dailyBudgetUsd < minimum) {
-    console.warn(
-      `[env] DAILY_BUDGET_USD (${formatUsd(dailyBudgetUsd)}) lebih kecil dari reservasi minimal 1 pertanyaan ` +
-        `(±${formatUsd(minimum)}) — semua pertanyaan chat akan ditolak dengan pesan limit harian.`,
-    );
-  }
 }
 
 /** Apakah API key provider chat ini sudah di-set (untuk dropdown UI). */

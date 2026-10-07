@@ -603,9 +603,11 @@ adalah rem ringan, dan **budget harian di database adalah batas kerasnya**.
   klien tidak bisa menyimpan cookie auth lalu membuang cookie sesi di tiap request untuk
   mendapat kuota baru, karena sesi baru wajib login ulang lewat limiter.
 - Rem brute-force berlapis:
-  - **Per IP, 20 percobaan/menit: rem utama.** Brute-force hanya bisa direm kalau penebaknya
-    bisa dikenali, dan IP satu-satunya identitas yang tidak bisa diganti gratis. IP hanya
-    dipercaya di Vercel atau kalau `TRUSTED_PROXY_HOPS` di-set (lihat di bawah).
+  - **Per IP, 20 passcode salah/menit: rem utama.** Brute-force hanya bisa direm kalau
+    penebaknya bisa dikenali, dan IP satu-satunya identitas yang tidak bisa diganti gratis.
+    Yang dihitung hanya passcode **salah**: satu kelas berisi 30 murid di belakang 1 IP NAT
+    (lab sekolah) tetap bisa login semua dalam semenit. IP hanya dipercaya di Vercel atau
+    kalau `TRUSTED_PROXY_HOPS` di-set (lihat di bawah).
   - Per sesi, 5 percobaan/menit. Mudah diakali dengan membuang cookie, tapi menahan user
     biasa yang salah ketik berulang-ulang.
   - **Plafon global 300 passcode salah/menit** dari semua klien. Plafon ini sengaja tinggi.
@@ -632,7 +634,7 @@ adalah rem ringan, dan **budget harian di database adalah batas kerasnya**.
 | `chatIpRateLimiter` | IP tepercaya | 120/menit | `/api/chat` |
 | `uploadIpRateLimiter` | IP tepercaya | 30/menit | `/api/upload` |
 | `passcodeRateLimiter` | session id | 5/menit | `POST /api/auth` |
-| `passcodeIpRateLimiter` | IP tepercaya | 20/menit (rem utama) | `POST /api/auth` |
+| `passcodeIpRateLimiter` | IP tepercaya | 20 salah/menit (rem utama) | `POST /api/auth` |
 | `passcodeFailureLimiter` | 1 key global | 300 salah/menit (plafon) | `POST /api/auth` |
 
 Algoritmanya sliding window log (`lib/server/rateLimit.ts`). Request yang ditolak tidak

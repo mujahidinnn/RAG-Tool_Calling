@@ -141,7 +141,7 @@ describe("admitPasscodeAttempt — rem brute-force POST /api/auth", () => {
   ): "ok" | "wrong" | "blocked" {
     if (admitPasscodeAttempt(limiters, freshSession(), ip, now)) return "blocked";
     if (correct) return "ok";
-    recordPasscodeFailure(limiters, now);
+    recordPasscodeFailure(limiters, ip, now);
     return "wrong";
   }
 
@@ -194,9 +194,10 @@ describe("admitPasscodeAttempt — rem brute-force POST /api/auth", () => {
     let lastBlock: ReturnType<typeof admitPasscodeAttempt> = null;
     for (let i = 0; i < 400; i++) {
       const now = T0 + i * 10;
-      lastBlock = admitPasscodeAttempt(limiters, freshSession(), `10.0.${Math.floor(i / 250)}.${i % 250}`, now);
+      const ip = `10.0.${Math.floor(i / 250)}.${i % 250}`;
+      lastBlock = admitPasscodeAttempt(limiters, freshSession(), ip, now);
       if (lastBlock) continue;
-      recordPasscodeFailure(limiters, now);
+      recordPasscodeFailure(limiters, ip, now);
       wrong++;
     }
     assert.equal(wrong, PASSCODE_GLOBAL_FAILURE_LIMIT.max, "rotasi sesi/IP tidak menambah jatah tebakan");
@@ -206,6 +207,19 @@ describe("admitPasscodeAttempt — rem brute-force POST /api/auth", () => {
     assert.equal(admitPasscodeAttempt(limiters, "sesi-user", "198.51.100.7", T0 + 4_000)?.scope, "global");
     assert.equal(limiters.perSession.peek("sesi-user", T0 + 4_000).remaining, PASSCODE_RATE_LIMIT.max);
     assert.equal(limiters.perIp.peek("ip:198.51.100.7", T0 + 4_000).remaining, PASSCODE_IP_RATE_LIMIT.max);
+  });
+
+  it("1 kelas (>20 murid) di belakang 1 IP NAT bisa login semua: login BENAR tidak dihitung per IP", () => {
+    const limiters = freshLimiters();
+    const natIp = "203.0.113.50";
+    const results = Array.from({ length: 40 }, (_, i) => attempt(limiters, natIp, true, T0 + i * 500));
+    assert.ok(results.every((result) => result === "ok"), results.join(","));
+    // Tebakan SALAH dari IP yang sama tetap direm setelah PASSCODE_IP_RATE_LIMIT.max.
+    const wrong = Array.from({ length: PASSCODE_IP_RATE_LIMIT.max + 1 }, (_, i) =>
+      attempt(limiters, natIp, false, T0 + 30_000 + i),
+    );
+    assert.equal(wrong.filter((result) => result === "wrong").length, PASSCODE_IP_RATE_LIMIT.max);
+    assert.equal(wrong.at(-1), "blocked");
   });
 
   it("limiter sesi/IP milik klien sendiri → scope 'client'", () => {

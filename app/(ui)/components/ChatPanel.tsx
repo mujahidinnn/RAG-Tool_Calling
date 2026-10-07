@@ -93,6 +93,12 @@ export function ChatPanel({ providers, defaultProvider, documents, onUnauthorize
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = "auto";
+    // Panel tersembunyi (tab mobile `display:none`) → scrollHeight = 0. Jangan
+    // kunci tinggi 0px; biarkan tinggi alami rows={1} sampai panel terlihat.
+    if (el.scrollHeight === 0) {
+      el.style.height = "";
+      return;
+    }
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [input]);
 

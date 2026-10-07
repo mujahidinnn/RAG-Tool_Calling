@@ -99,7 +99,8 @@ export async function POST(request: Request): Promise<Response> {
     // Rate limit sebelum parse & cek passcode supaya setiap percobaan terhitung.
     // Lapis: per IP (rem utama, kalau IP bisa dipercaya), per sesi, dan plafon
     // global passcode salah (lib/server/rateLimit.ts).
-    const blocked = admitPasscodeAttempt(passcodeLimiters, sessionId, getClientIp(request.headers));
+    const clientIp = getClientIp(request.headers);
+    const blocked = admitPasscodeAttempt(passcodeLimiters, sessionId, clientIp);
     if (blocked) {
       return tooManyAttempts(
         blocked.result,
@@ -115,7 +116,7 @@ export async function POST(request: Request): Promise<Response> {
     }
 
     if (!verifyPasscode(parsed.data.passcode)) {
-      recordPasscodeFailure(passcodeLimiters);
+      recordPasscodeFailure(passcodeLimiters, clientIp);
       return jsonError(401, "invalid_passcode", "Passcode salah.");
     }
 

@@ -179,11 +179,15 @@ export type PasscodeAttemptBlock = {
 };
 
 /**
- * Cek & catat 1 percobaan passcode di semua lapis rem. null = boleh lanjut
- * cek passcode; kalau salah, panggil recordPasscodeFailure().
+ * Cek 1 percobaan passcode di semua lapis rem. null = boleh lanjut cek
+ * passcode; kalau salah, panggil recordPasscodeFailure().
+ * - Per sesi: dicatat di sini (user sah cukup login 1x per sesi).
+ * - Per IP & plafon global: hanya di-peek; yang dicatat hanya passcode SALAH.
+ *   Kalau login BENAR ikut dihitung, 1 kelas >20 murid di belakang 1 IP NAT
+ *   (lab sekolah) saling memblokir padahal tidak ada yang menebak.
  * Pemanggil WAJIB tidak await di antara fungsi ini dan recordPasscodeFailure():
- * plafon global hanya di-peek di sini, jadi request paralel yang menyelip di
- * celah await bisa sama-sama lolos sebelum ada yang tercatat.
+ * request paralel yang menyelip di celah await bisa sama-sama lolos sebelum
+ * ada yang tercatat.
  */
 export function admitPasscodeAttempt(
   limiters: PasscodeLimiters,
@@ -197,14 +201,19 @@ export function admitPasscodeAttempt(
   if (!global.allowed) return { scope: "global", result: global };
 
   const checks = [limiters.perSession.check(sessionId, now)];
-  if (ip !== null) checks.push(limiters.perIp.check(`ip:${ip}`, now));
+  if (ip !== null) checks.push(limiters.perIp.peek(`ip:${ip}`, now));
   const blocked = checks.find((result) => !result.allowed);
   return blocked ? { scope: "client", result: blocked } : null;
 }
 
 /** Catat 1 passcode SALAH ke plafon global. */
-export function recordPasscodeFailure(limiters: PasscodeLimiters, now: number = Date.now()): void {
+export function recordPasscodeFailure(
+  limiters: PasscodeLimiters,
+  ip: string | null,
+  now: number = Date.now(),
+): void {
   limiters.globalFailures.check(GLOBAL_KEY, now);
+  if (ip !== null) limiters.perIp.check(`ip:${ip}`, now);
 }
 
 /**
