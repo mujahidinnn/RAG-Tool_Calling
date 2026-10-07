@@ -13,29 +13,37 @@ keamanan dasar untuk demo publik yang memakai API key pribadi.
 Supabase (Postgres + pgvector + Storage) · Anthropic SDK + OpenAI SDK · zod · unpdf ·
 js-tiktoken.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/screenshots/hero-dark.png">
+    <img src="docs/screenshots/hero-light.png" alt="Tampilan desktop AI Docs Assistant: daftar 3 dokumen berstatus Siap di kiri, dan di kanan jawaban Claude tentang jatah cuti tahunan lengkap dengan badge sitasi, chip sumber, serta jumlah token dan estimasi biaya" width="900">
+  </picture>
+</p>
+
 ---
 
 ## Daftar isi
 
 1. [Fitur](#fitur)
-2. [Arsitektur](#arsitektur)
-3. [Struktur folder](#struktur-folder)
-4. [Adapter multi-LLM (`ChatProvider`)](#adapter-multi-llm-chatprovider)
-5. [Prompt injection: kenapa perlu mitigasi](#prompt-injection-kenapa-perlu-mitigasi)
-6. [Trade-off k=5 vs k lebih besar](#trade-off-k5-vs-k-lebih-besar)
-7. [Kenapa embedding 1 provider, chat multi-provider](#kenapa-embedding-1-provider-chat-multi-provider)
-8. [Proteksi biaya & penyalahgunaan](#proteksi-biaya--penyalahgunaan)
-9. [Pengamanan upload](#pengamanan-upload)
-10. [Isolasi sesi](#isolasi-sesi)
-11. [Auto-hapus 24 jam](#auto-hapus-24-jam)
-12. [Keputusan desain yang berbeda dari spec](#keputusan-desain-yang-berbeda-dari-spec)
-13. [Menjalankan secara lokal](#menjalankan-secara-lokal)
-14. [Environment variable](#environment-variable)
-15. [Catatan deployment](#catatan-deployment)
-16. [Cara menguji manual](#cara-menguji-manual)
-17. [Model & harga](#model--harga)
-18. [Keterbatasan yang diketahui](#keterbatasan-yang-diketahui)
-19. [Urutan membaca kode (untuk belajar)](#urutan-membaca-kode-untuk-belajar)
+2. [Tampilan aplikasi](#tampilan-aplikasi)
+3. [Arsitektur](#arsitektur)
+4. [Struktur folder](#struktur-folder)
+5. [Adapter multi-LLM (`ChatProvider`)](#adapter-multi-llm-chatprovider)
+6. [Prompt injection: kenapa perlu mitigasi](#prompt-injection-kenapa-perlu-mitigasi)
+7. [Trade-off k=5 vs k lebih besar](#trade-off-k5-vs-k-lebih-besar)
+8. [Kenapa embedding 1 provider, chat multi-provider](#kenapa-embedding-1-provider-chat-multi-provider)
+9. [Proteksi biaya & penyalahgunaan](#proteksi-biaya--penyalahgunaan)
+10. [Pengamanan upload](#pengamanan-upload)
+11. [Isolasi sesi](#isolasi-sesi)
+12. [Auto-hapus 24 jam](#auto-hapus-24-jam)
+13. [Keputusan desain yang berbeda dari spec](#keputusan-desain-yang-berbeda-dari-spec)
+14. [Menjalankan secara lokal](#menjalankan-secara-lokal)
+15. [Environment variable](#environment-variable)
+16. [Catatan deployment](#catatan-deployment)
+17. [Cara menguji manual](#cara-menguji-manual)
+18. [Model & harga](#model--harga)
+19. [Keterbatasan yang diketahui](#keterbatasan-yang-diketahui)
+20. [Urutan membaca kode (untuk belajar)](#urutan-membaca-kode-untuk-belajar)
 
 ---
 
@@ -90,6 +98,73 @@ js-tiktoken.
 - Dark mode mengikuti sistem. Animasi menghormati `prefers-reduced-motion`.
 - Aksesibilitas: Enter kirim / Shift+Enter baris baru, focus ring terlihat, area jawaban
   `aria-live="polite"`, semua tombol ikon punya `aria-label`.
+
+## Tampilan aplikasi
+
+> Screenshot diambil dari build production di lingkungan uji lokal (Postgres + pgvector,
+> Supabase Storage tiruan, dan mock API Anthropic/OpenAI yang memakai format wire asli).
+> Perusahaan "PT Nusantara Digital" dan dokumennya fiktif. Teks jawaban dibuat oleh mock,
+> jadi gaya bahasa model asli bisa sedikit berbeda; angka token & biaya dihitung oleh app.
+
+### Tanya jawab dengan sitasi
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/streaming.png" alt="Jawaban kedua sedang di-stream dengan kursor berkedip di akhir teks, di bawah jawaban pertama yang sudah lengkap dengan sitasi"></td>
+    <td width="50%"><img src="docs/screenshots/sources-panel.png" alt="Panel Sumber jawaban terbuka, menampilkan teks asli chunk #0 dari kebijakan-cuti-2026.md yang dikutip sebagai sumber [1]"></td>
+  </tr>
+  <tr>
+    <td>Jawaban di-stream token demi token dengan kursor berkedip, bukan spinner. Tombol stop
+    muncul selama streaming.</td>
+    <td>Klik badge sitasi → panel menampilkan potongan dokumen aslinya sebagai teks biasa
+    (di-escape), lengkap dengan skor kemiripan.</td>
+  </tr>
+</table>
+
+### Tool calling
+
+<p align="center">
+  <img src="docs/screenshots/tool-calling.png" alt="Permintaan ringkasan panduan onboarding: kartu tool list_uploaded_documents berisi 3 dokumen, kartu tool get_document_summary berisi 5 poin ringkasan, lalu jawaban akhir dengan sitasi" width="820">
+</p>
+
+Model memanggil `list_uploaded_documents` lalu `get_document_summary`. Hasil tiap tool tampil
+sebagai kartu terpisah dari jawaban chat, lalu model melanjutkan jawabannya
+(lihat [Loop tool call](#loop-tool-call)).
+
+### Claude vs GPT, tanpa fallback diam-diam
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/provider-compare.png" alt="Pertanyaan yang sama dijawab Claude lalu GPT dalam satu percakapan, masing-masing dengan badge provider, model, jumlah token, dan estimasi biaya"></td>
+    <td width="50%"><img src="docs/screenshots/provider-error.png" alt="Kartu error yang menjelaskan API key Anthropic tidak valid, dengan tombol eksplisit Tanya pakai GPT"></td>
+  </tr>
+  <tr>
+    <td>Provider dipilih per pertanyaan. Badge, token, dan biaya per jawaban membuat
+    perbandingan kedua model terlihat nyata.</td>
+    <td>Kalau provider gagal, UI menyebut provider mana dan kenapa. Pindah ke provider lain
+    hanya lewat pilihan eksplisit user.</td>
+  </tr>
+</table>
+
+### Mobile & dark mode
+
+<p align="center">
+  <img src="docs/screenshots/mobile-chat.png" alt="Tampilan mobile 390 px, tab Chat: jawaban tentang cuti khusus dengan chip sumber dan baris token serta biaya" width="270">
+  &nbsp;&nbsp;
+  <img src="docs/screenshots/mobile-docs-dark.png" alt="Tampilan mobile dalam dark mode, tab Dokumen: area upload, disclaimer privasi, dan 3 dokumen berstatus Siap" width="270">
+</p>
+
+Di bawah 1024 px layout berubah jadi 1 kolom dengan tab Dokumen / Chat. Dark mode mengikuti
+preferensi sistem.
+
+### Gerbang passcode
+
+<p align="center">
+  <img src="docs/screenshots/passcode.png" alt="Layar gerbang passcode demo sebelum user bisa upload atau chat" width="640">
+</p>
+
+Upload dan chat baru bisa dipakai setelah passcode demo benar
+(lihat [Proteksi biaya & penyalahgunaan](#proteksi-biaya--penyalahgunaan)).
 
 ---
 
@@ -313,6 +388,7 @@ lain-lain.
 │       ├── client.ts                # client service role (server-only, lazy)
 │       └── schema.sql               # tabel, fungsi RPC, RLS, bucket Storage
 ├── tests/                           # 23 file node:test (npm test)
+├── docs/screenshots/                # screenshot untuk README (light/dark, desktop/mobile)
 ├── proxy.ts                         # (pengganti middleware di Next 16) cookie sesi di "/"
 ├── instrumentation.ts               # baca env saat server start → peringatan konfigurasi di log
 ├── next.config.ts                   # cacheComponents + loader Tailwind untuk Turbopack
